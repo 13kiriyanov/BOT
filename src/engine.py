@@ -29,6 +29,7 @@ from .discovery import MarketDiscovery
 from .execution import OrderManager
 from .fair_value import FairValueModel
 from .logging_setup import log_event
+from .markout import MarkoutTracker
 from .models import (
     ONE,
     POSITION_DECIMALS,
@@ -73,6 +74,8 @@ class TradingEngine:
         )
         self.quoter = QuoteGenerator(settings.strategy, settings.risk)
         self.risk = RiskManager(settings.risk)
+        # Замер adverse selection по каждому филлу (см. markout.py).
+        self.markout = MarkoutTracker(self._markout_mid)
 
         self.discovery: MarketDiscovery | None = None
         self.orders: OrderManager | None = None
@@ -305,6 +308,23 @@ class TradingEngine:
             self.positions[condition_id] = MarketPosition(condition_id=condition_id)
         return self.positions[condition_id]
 
+    def _markout_mid(self, token_id: str, complement_id: str) -> Decimal | None:
+        """
+        Mid токена для замера mark-out: прямая книга, иначе зеркало из
+        дополнения. Протухшая книга — это не цена: рынок мог истечь, и
+        замороженный mid дал бы фиктивный mark-out.
+        """
+        stale_after = self.cfg.risk.stale_book_timeout_s
+        book = self.books.book(token_id)
+        if book is not None and not book.is_stale(stale_after):
+            mid = book.mid
+            if mid is not None:
+                return mid
+        implied = self.books.implied_from_complement(token_id, complement_id)
+        if implied is not None and not implied.is_stale(stale_after):
+            return implied.mid
+        return None
+
     async def _on_fill(self, fill: Fill) -> None:
         """Колбэк из user stream: обновить позицию и риск."""
         market = self.markets.get(fill.condition_id)
@@ -324,6 +344,10 @@ class TradingEngine:
         self.risk.record_fill(fill.price, fill.size)
         if pos.realized_pnl != before:
             self.risk.record_realized(pos.realized_pnl - before)
+
+        self.markout.record_fill(
+            fill, outcome, market.token_for(market.other(outcome))
+        )
 
         pairs = pos.complete_pairs
         basis = pos.pair_cost_basis()
@@ -436,6 +460,7 @@ class TradingEngine:
         if stale:
             await self.orders.cancel(stale)  # type: ignore[union-attr]
         self.discovery.forget(market.condition_id)  # type: ignore[union-attr]
+        self.markout.forget_market(market.condition_id)
 
     def _book_for(self, market: TargetMarket, outcome: str) -> Book | None:
         """Стакан токена, при необходимости восстановленный из дополнения."""
@@ -677,9 +702,11 @@ class TradingEngine:
                 fees, gas,
                 "HALTED:" + snap["reason"] if snap["halted"] else "OK",
             )
+            for line in self.markout.summary_lines():
+                log.info(line)
             log_event(
                 "status", **snap, pairs=pairs, merged=merged, net=net,
-                fees=fees, merge_gas=gas,
+                fees=fees, merge_gas=gas, markout=self.markout.summary(),
             )
 
     async def sync_loop(self) -> None:
@@ -739,6 +766,10 @@ class TradingEngine:
 
         self.spot.stop()
         self.books.stop()
+        try:
+            await asyncio.wait_for(self.markout.aclose(), timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Не удалось остановить замеры mark-out: %s", exc)
 
         for t in self._tasks:
             t.cancel()

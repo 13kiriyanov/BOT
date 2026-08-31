@@ -339,6 +339,39 @@ def test_merge_books_gas_into_pnl():
     assert engine.risk.state.realized_pnl == pytest.approx(D("2.98"))
 
 
+# ------------------------------------------------------------- mark-out
+
+
+def test_fill_schedules_markout_measurement():
+    """Каждый филл попадает в трекер mark-out с верным дополнением."""
+    from src.markout import MarkoutTracker
+
+    events = []
+
+    def sink(event, **fields):
+        events.append(fields)
+
+    engine = make_engine(FakeClient())
+    engine.markets["0xcond"] = make_market()
+    engine.markout = MarkoutTracker(
+        engine._markout_mid, horizons_s=(0.01,), sink=sink
+    )
+
+    async def drive():
+        await engine._on_fill(make_fill(token_id="tok_no", price=D("0.48")))
+        while engine.markout.pending:
+            await asyncio.sleep(0.005)
+
+    asyncio.run(drive())
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["outcome"] == "NO"
+    assert ev["token"] == "tok_no"
+    # Книг в тесте нет — mid недоступен, и это честно отражено, а не выдумано.
+    assert ev["markout_0.01s"] is None
+
+
 # ---------------------------------------------------------- сверка комиссии
 
 
