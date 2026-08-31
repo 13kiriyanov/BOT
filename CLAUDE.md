@@ -44,6 +44,30 @@ CTF-позиции — ERC-1155 с 6 знаками, и SDK сверяет `amou
 **Все ордера `post_only=True`.** Мы мейкер. Ордер, пересекающий спред, должен
 быть отклонён биржей, а не исполнен как тейкер.
 
+**Событие trade user-канала описывает ТЕЙКЕРА.** Верхнеуровневые
+side/price/size — его; наша мейкерская нога лежит в `maker_orders` со
+своими side/price/matched_amount. Читать верхнеуровневые поля как свой
+филл значит перевернуть знак позиции. Разбор — только через
+`_extract_own_fills` в `execution.py`.
+
+## Единицы на границе с SDK
+
+Баг «не те единицы» не падает — он молча делает не то. Каждый вызов
+`client.*` с числами закреплён канарейкой в `tests/test_units.py`; если
+после обновления SDK канарейка упала (включая ImportError на приватном
+пути) — перепроверь единицы руками, а не чини тест до зелёного.
+Новый вызов `client.*` с числом = строка здесь + канарейка там.
+
+| Вызов | Единицы | Канарейка |
+|---|---|---|
+| `create_limit_order(price, size)` | человеческие: USDC-цена 0..1, shares | `test_limit_order_price_and_size_are_human_units` |
+| `create_limit_order(expiration)` | unix-секунды, не ближе now+180 (иначе UserInputError) | `test_limit_order_expiration_is_unix_seconds_with_exchange_minimum` |
+| `merge_positions(amount)` | БАЗОВЫЕ единицы, 1e6 = 1 share | `test_merge_amount_is_base_units_and_scale_matches_sdk` |
+| `list_positions()` → size, avg_price | человеческие | `test_position_model_returns_human_units` |
+| `list_open_orders()` → price, sizes | человеческие | `test_open_order_model_returns_human_units` |
+| `get_balance_allowance()` → balance | БАЗОВЫЕ единицы (int) | `test_balance_allowance_is_base_units_not_usdc` |
+| user-stream trade → price/size | человеческие; верхний уровень — тейкер, наша нога в maker_orders | `test_user_trade_payload_units_and_maker_shape` |
+
 **`merge_positions()` — не оптимизация, а суть стратегии.** Он превращает
 пару YES+NO обратно в $1 USDC не дожидаясь резолюции. Без него капитал
 заморожен до конца окна и бот делает 1–2 круга вместо десятков.
