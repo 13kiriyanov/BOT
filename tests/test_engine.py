@@ -54,6 +54,7 @@ class Cfg:
         merge_min_profit_ratio = D("3")
         recover_positions = True
         fallback_fee_rate = D("0.02")
+        fallback_min_order_size = D("5")
 
     class risk:
         max_position_per_side = D("250")
@@ -337,6 +338,110 @@ def test_merge_books_gas_into_pnl():
     assert pos.realized_pnl == pytest.approx(D("2.98"))
     assert pos.merge_costs == D("0.02")
     assert engine.risk.state.realized_pnl == pytest.approx(D("2.98"))
+
+
+# ------------------------------------------------------- сверка позиций
+
+
+def sync_once(engine) -> None:
+    asyncio.run(engine._sync_positions_once())
+
+
+def test_position_sync_corrects_medium_divergence_to_exchange():
+    """
+    Учёт разошёлся с биржей больше, чем на min_order_size: предупреждение
+    и коррекция К БИРЖЕ — она источник правды, а не наш локальный счётчик.
+    """
+    client = FakeClient(
+        positions=[
+            ApiPosition(
+                condition_id="0xcond", token_id="tok_yes", size="35",
+                avg_price="0.49", outcome="Up", redeemable=False,
+            )
+        ]
+    )
+    engine = make_engine(client)
+    engine.markets["0xcond"] = make_market()
+    pos = engine._position("0xcond")
+    pos.apply_fill("YES", "BUY", D("0.50"), D("50"))  # локально 50, на бирже 35
+    pnl_before = pos.realized_pnl
+
+    sync_once(engine)
+
+    assert pos.yes_size == D("35")
+    # Средняя цена осталась наша: коррекция — не сделка.
+    assert pos.yes_cost == D("0.50") * D("35")
+    assert pos.realized_pnl == pnl_before
+    assert not engine.risk.is_halted
+
+
+def test_position_sync_tolerates_small_divergence():
+    """Расхождение в пределах min_order_size — не сигнал, а шум округления."""
+    client = FakeClient(
+        positions=[
+            ApiPosition(
+                condition_id="0xcond", token_id="tok_yes", size="48",
+                avg_price="0.49", outcome="Up", redeemable=False,
+            )
+        ]
+    )
+    engine = make_engine(client)
+    engine.markets["0xcond"] = make_market()  # min_order_size = 5
+    engine._position("0xcond").apply_fill("YES", "BUY", D("0.50"), D("50"))
+
+    sync_once(engine)
+    assert engine.positions["0xcond"].yes_size == D("50")  # не тронуто
+
+
+def test_position_sync_halts_on_large_divergence():
+    """Расхождение больше order_size*3 — учёт недостоверен, торговать нельзя."""
+    client = FakeClient(positions=[])  # на бирже пусто
+    engine = make_engine(client)
+    engine.markets["0xcond"] = make_market()
+    engine._position("0xcond").apply_fill("YES", "BUY", D("0.50"), D("100"))
+    # 100 - 0 = 100 > order_size(20) * 3
+
+    sync_once(engine)
+
+    assert engine.risk.is_halted
+    assert engine.risk.state.reason == HaltReason.DESYNC
+
+
+def test_position_sync_skips_markets_with_recent_activity():
+    """
+    data-api отстаёт от CLOB: сразу после филла «расхождение» — это лаг
+    индексатора. Рынки со свежей активностью сверка не трогает.
+    """
+    client = FakeClient(positions=[])
+    engine = make_engine(client)
+    engine.markets["0xcond"] = make_market()
+    engine._position("0xcond").apply_fill("YES", "BUY", D("0.50"), D("100"))
+    engine._last_activity["0xcond"] = time.time()  # только что был филл
+
+    sync_once(engine)
+
+    assert not engine.risk.is_halted
+    assert engine.positions["0xcond"].yes_size == D("100")
+
+
+def test_position_sync_books_exchange_only_position():
+    """Позиция есть на бирже, но не в учёте — бронируется по данным биржи."""
+    client = FakeClient(
+        positions=[
+            ApiPosition(
+                condition_id="0xother", token_id="tok_x", size="30",
+                avg_price="0.40", outcome="Yes", redeemable=False,
+            )
+        ]
+    )
+    engine = make_engine(client)  # локально по 0xother ничего нет
+
+    sync_once(engine)
+
+    pos = engine.positions["0xother"]
+    assert pos.yes_size == D("30")
+    assert pos.yes_cost == D("0.40") * D("30")   # средняя взята с биржи
+    assert not engine.risk.is_halted
 
 
 # ------------------------------------------------------------- mark-out

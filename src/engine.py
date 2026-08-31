@@ -8,6 +8,7 @@
   discovery_loop  — периодический поиск активных рынков
   quote_loop      — ГЛАВНЫЙ цикл: пересчёт и перевыставление котировок
   merge_loop      — merge полных пар обратно в USDC
+  position_sync   — сверка локального учёта позиций с биржей
   watchdog        — dead-man switch
 
 Watchdog намеренно живёт в отдельной задаче и следит за heartbeat главного
@@ -54,6 +55,13 @@ log = logging.getLogger("polybot.engine")
 # Читаем настойчиво: неудача здесь означает остановку торговли.
 RECOVERY_ATTEMPTS = 3
 RECOVERY_RETRY_DELAY_S = 2.0
+
+# Период сверки локального учёта позиций с биржей.
+POSITION_SYNC_INTERVAL_S = 60.0
+# Рынки со свежим филлом или merge сверка пропускает: data-api, из которого
+# читается list_positions(), отстаёт от CLOB на секунды, и сразу после
+# исполнения «расхождение» — это лаг индексатора, а не ошибка учёта.
+SYNC_ACTIVITY_GUARD_S = 90.0
 
 
 class TradingEngine:
@@ -716,6 +724,120 @@ class TradingEngine:
             if self.orders and not self.risk.is_halted:
                 await self.orders.sync_open_orders()
 
+    # ------------------------------------------------- сверка позиций
+
+    async def position_sync_loop(self) -> None:
+        """
+        Периодическая сверка локального учёта позиций с биржей.
+
+        Локальный учёт строится из событий user-stream, а события теряются:
+        разрыв WebSocket, пропущенный статус, FAILED после учтённого
+        MATCHED, merge, не прошедший on-chain. Каждая потеря — тихое
+        расхождение с реальностью, на котором все лимиты риска считаются
+        от вымышленной позиции. Сверка — единственный механизм, который
+        возвращает учёт к фактам.
+        """
+        while not self._shutdown.is_set():
+            await asyncio.sleep(POSITION_SYNC_INTERVAL_S)
+            if self.cfg.runtime.dry_run or self.risk.is_halted:
+                # В dry run филлы локальные, на бирже их нет — сверять нечего.
+                continue
+            try:
+                await self._sync_positions_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.error("position_sync_loop: %s", exc)
+
+    def _exchange_outcome(self, rec: RecoveredPosition) -> Outcome | None:
+        """Сторона биржевой позиции: token_id рынка надёжнее ярлыка API."""
+        market = self.markets.get(rec.condition_id)
+        if market is not None and rec.token_id:
+            if rec.token_id == market.yes_token_id:
+                return "YES"
+            if rec.token_id == market.no_token_id:
+                return "NO"
+        return rec.outcome
+
+    async def _sync_positions_once(self) -> None:
+        """Одна сверка: расхождение больше допуска — предупреждение и
+        коррекция к данным биржи; больше order_size*3 — остановка."""
+        exchange: dict[str, dict[Outcome, RecoveredPosition]] = {}
+        async for p in self.client.list_positions():  # type: ignore[union-attr]
+            rec = RecoveredPosition.from_api(p)
+            if rec is None or rec.redeemable:
+                continue
+            outcome = self._exchange_outcome(rec)
+            if outcome is None:
+                log.warning(
+                    "Сверка: у позиции %s не определить сторону — пропускаю",
+                    rec.title or rec.condition_id[:12],
+                )
+                continue
+            exchange.setdefault(rec.condition_id, {})[outcome] = rec
+
+        now = time.time()
+        halt_threshold = self.cfg.strategy.order_size * 3
+
+        for cid in sorted(set(self.positions) | set(exchange)):
+            if now - self._last_activity.get(cid, 0.0) < SYNC_ACTIVITY_GUARD_S:
+                log.debug("Сверка %s: свежая активность, пропускаю", cid[:12])
+                continue
+
+            market = self.markets.get(cid)
+            tolerance = (
+                market.min_order_size
+                if market is not None
+                else self.cfg.strategy.fallback_min_order_size
+            )
+            pos = self.positions.get(cid)
+
+            for outcome in ("YES", "NO"):
+                local = ZERO
+                if pos is not None:
+                    local = pos.yes_size if outcome == "YES" else pos.no_size
+                rec = exchange.get(cid, {}).get(outcome)  # type: ignore[arg-type]
+                exch = rec.size if rec is not None else ZERO
+                diff = abs(local - exch)
+                if diff <= tolerance:
+                    continue
+
+                if diff > halt_threshold:
+                    log.critical(
+                        "РАСХОЖДЕНИЕ УЧЁТА: %s %s локально=%s на бирже=%s "
+                        "(разница %s > %s). Учёт недостоверен — останавливаюсь.",
+                        cid[:12], outcome, local, exch, diff, halt_threshold,
+                    )
+                    log_event(
+                        "position_desync", condition_id=cid, outcome=outcome,
+                        local=local, exchange=exch, diff=diff, action="halt",
+                    )
+                    self.risk.halt(
+                        HaltReason.DESYNC,
+                        f"{cid[:12]} {outcome}: локально {local}, на бирже {exch}",
+                    )
+                    return
+
+                log.warning(
+                    "Расхождение учёта: %s %s локально=%s на бирже=%s — "
+                    "корректирую к бирже",
+                    cid[:12], outcome, local, exch,
+                )
+                log_event(
+                    "position_desync", condition_id=cid, outcome=outcome,
+                    local=local, exchange=exch, diff=diff, action="correct",
+                )
+                self._position(cid).correct_side(
+                    outcome,  # type: ignore[arg-type]
+                    exch,
+                    rec.avg_price if rec is not None else None,
+                )
+                # Коррекция уже учла биржевое состояние — отложенное
+                # восстановление по этим токенам стало бы двойным учётом.
+                for token, pending in list(self._recovered_by_token.items()):
+                    if pending.condition_id == cid:
+                        self._recovered_by_token.pop(token, None)
+
     # ------------------------------------------------------------- run
 
     async def run(self) -> None:
@@ -738,6 +860,7 @@ class TradingEngine:
             asyncio.create_task(self.watchdog(), name="watchdog"),
             asyncio.create_task(self.status_loop(), name="status"),
             asyncio.create_task(self.sync_loop(), name="sync"),
+            asyncio.create_task(self.position_sync_loop(), name="possync"),
         ]
 
         log.info("Ждём наполнения фидов (5с) перед первым котированием...")
