@@ -36,7 +36,17 @@ from __future__ import annotations
 import logging
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
-from .models import ONE, ZERO, Book, FairValue, MarketPosition, Quote, TargetMarket
+from .models import (
+    ONE,
+    ZERO,
+    Book,
+    FairValue,
+    MarketPosition,
+    Outcome,
+    Quote,
+    TargetMarket,
+)
+from .regime import Regime, RegimeState
 
 log = logging.getLogger("polybot.quote")
 
@@ -176,9 +186,21 @@ class QuoteGenerator:
         position: MarketPosition,
         yes_book: Book | None,
         no_book: Book | None,
+        regime: RegimeState | None = None,
     ) -> list[Quote]:
         """Сформировать желаемые котировки (BUY YES и BUY NO)."""
         tick = market.tick_size
+
+        # РЕЖИМ VOLATILE: рынок движется быстрее, чем мы успеваем
+        # переставляться, — любая котировка становится бесплатным опционом
+        # для быстрых. Не котируем вовсе.
+        if (
+            regime is not None
+            and regime.regime is Regime.VOLATILE
+            and self.s.regime_volatile_no_quote
+        ):
+            log.debug("[%s] Режим VOLATILE — не котирую", market.slug)
+            return []
 
         r = self.reservation_price(fv.fair, position, fv)
         r = clamp_price(r, tick)
@@ -216,12 +238,42 @@ class QuoteGenerator:
         raw_yes_bid = r - half
         raw_no_bid = (ONE - r) - half
 
+        # РЕЖИМ TRENDING: поток тейкеров односторонний. Сторону, которую
+        # нам засыпают, отодвигаем (или снимаем): продолжать подставлять её
+        # под вынос значит копить проигрышный инвентарь. Противоположную
+        # подтягиваем к рынку: каждый её филл достраивает пару к уже
+        # накопленному. Кросс-валидация конфига гарантирует
+        # extra >= tighten, то есть сумма пары от асимметрии не растёт.
+        removed_side: Outcome | None = None
+        if (
+            regime is not None
+            and regime.regime is Regime.TRENDING
+            and regime.crowded_side is not None
+            and self.s.regime_trending_response
+        ):
+            extra = tick * self.s.trending_crowded_extra_ticks
+            tighten = tick * self.s.trending_tighten_ticks
+            if regime.crowded_side == "YES":
+                raw_yes_bid -= extra
+                raw_no_bid += tighten
+            else:
+                raw_no_bid -= extra
+                raw_yes_bid += tighten
+            if self.s.trending_remove_crowded:
+                removed_side = regime.crowded_side
+
         # Распределяем допустимый бюджет пропорционально.
         max_yes = budget - raw_no_bid
         max_no = budget - raw_yes_bid
 
         yes_price = self._place_bid(raw_yes_bid, yes_book, tick, max_yes)
         no_price = self._place_bid(raw_no_bid, no_book, tick, max_no)
+
+        if removed_side is not None:
+            return self._starving_side_quote(
+                market, fv, position, removed_side,
+                yes_price if removed_side == "NO" else no_price,
+            )
 
         quotes: list[Quote] = []
         if yes_price is None or no_price is None:
@@ -256,6 +308,30 @@ class QuoteGenerator:
             Quote(market.no_token_id, "NO", "BUY", no_price, no_size)
         )
         return quotes
+
+    def _starving_side_quote(
+        self,
+        market: TargetMarket,
+        fv: FairValue,
+        position: MarketPosition,
+        removed_side: Outcome,
+        price: Decimal | None,
+    ) -> list[Quote]:
+        """
+        Одиночная котировка противоположной стороны, когда сторона под
+        выносом снята (trending_remove_crowded). Пары эта нога достраивает
+        к уже накопленному инвентарю, поэтому парного инварианта здесь
+        нет — есть только цена, зажатая бюджетом и книгой в _place_bid.
+        """
+        outcome: Outcome = "YES" if removed_side == "NO" else "NO"
+        if price is None:
+            return []
+        size = self._size_for(market, position, outcome, fv)
+        log.debug(
+            "[%s] TRENDING: сторона %s снята, котирую только %s @ %s",
+            market.slug, removed_side, outcome, price,
+        )
+        return [Quote(market.token_for(outcome), outcome, "BUY", price, size)]
 
     def build_unwind_quotes(
         self, market: TargetMarket, position: MarketPosition, book: Book | None

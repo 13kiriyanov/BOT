@@ -47,6 +47,7 @@ from .models import (
 from .orderbook import OrderBookManager
 from .price_feed import SpotFeed
 from .quoting import QuoteGenerator
+from .regime import Regime, RegimeDetector
 from .risk import HaltReason, RiskManager
 
 log = logging.getLogger("polybot.engine")
@@ -84,6 +85,11 @@ class TradingEngine:
         self.risk = RiskManager(settings.risk)
         # Замер adverse selection по каждому филлу (см. markout.py).
         self.markout = MarkoutTracker(self._markout_mid)
+        # Детектор режима на каждый актив (BTC/ETH). Кормится тиками спота
+        # и нашими филлами; реакция котирования включается флагами конфига.
+        self._regimes: dict[str, RegimeDetector] = {}
+        self._last_regime: dict[str, Regime] = {}
+        self.spot.add_listener(self._on_spot_tick)
 
         self.discovery: MarketDiscovery | None = None
         self.orders: OrderManager | None = None
@@ -316,6 +322,26 @@ class TradingEngine:
             self.positions[condition_id] = MarketPosition(condition_id=condition_id)
         return self.positions[condition_id]
 
+    def _regime_for(self, asset: str) -> RegimeDetector:
+        if asset not in self._regimes:
+            self._regimes[asset] = RegimeDetector.from_settings(self.cfg.strategy)
+            self._last_regime[asset] = Regime.CALM
+        return self._regimes[asset]
+
+    def _on_spot_tick(self, asset: str, price: float, ts: float) -> None:
+        detector = self._regime_for(asset)
+        detector.on_spot(price, ts)
+        self._note_regime_change(asset, detector)
+
+    def _note_regime_change(self, asset: str, detector: RegimeDetector) -> None:
+        current = detector.regime
+        if current == self._last_regime.get(asset):
+            return
+        self._last_regime[asset] = current
+        snap = detector.snapshot()
+        log.warning("[%s] РЕЖИМ РЫНКА: %s | %s", asset, current.value, snap)
+        log_event("regime", asset=asset, **snap)
+
     def _markout_mid(self, token_id: str, complement_id: str) -> Decimal | None:
         """
         Mid токена для замера mark-out: прямая книга, иначе зеркало из
@@ -356,6 +382,10 @@ class TradingEngine:
         self.markout.record_fill(
             fill, outcome, market.token_for(market.other(outcome))
         )
+
+        detector = self._regime_for(market.asset)
+        detector.on_fill(outcome, fill.side, fill.size, fill.ts)
+        self._note_regime_change(market.asset, detector)
 
         pairs = pos.complete_pairs
         basis = pos.pair_cost_basis()
@@ -576,7 +606,14 @@ class TradingEngine:
             return unwind
 
         # --- котировки ---------------------------------------------------
-        quotes = self.quoter.build_quotes(market, fv, pos, yes_book, no_book)
+        regime_state = (
+            self._regimes[market.asset].state()
+            if market.asset in self._regimes
+            else None
+        )
+        quotes = self.quoter.build_quotes(
+            market, fv, pos, yes_book, no_book, regime_state
+        )
 
         # --- финальный риск-клип размеров --------------------------------
         result: list[Quote] = []
@@ -712,6 +749,8 @@ class TradingEngine:
             )
             for line in self.markout.summary_lines():
                 log.info(line)
+            for asset, detector in sorted(self._regimes.items()):
+                log.info("РЕЖИМ %s | %s", asset, detector.snapshot())
             log_event(
                 "status", **snap, pairs=pairs, merged=merged, net=net,
                 fees=fees, merge_gas=gas, markout=self.markout.summary(),

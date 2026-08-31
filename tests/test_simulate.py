@@ -16,8 +16,11 @@ from simulate import mean_ci, paired_diff_ci, run_one, share_ci
 D = Decimal
 
 
-def sim(seed: int, toxicity: float) -> dict:
-    return run_one(60, 0.55, 0.012, 0.02, seed, toxicity, 0.45, D("0"), D("0.01"))
+def sim(seed: int, toxicity: float, trend_prob: float = 0.0) -> dict:
+    return run_one(
+        60, 0.55, 0.012, 0.02, seed, toxicity, 0.45, D("0"), D("0.01"),
+        trend_prob, 1.5,
+    )
 
 
 def test_mean_ci_matches_hand_calculation():
@@ -61,6 +64,52 @@ def test_rng_streams_are_isolated_by_purpose():
     # но gauss-шок — никогда. Сравниваем два уровня, при которых шок
     # не срабатывает ни разу: 0.0 и отрицательный (условие всегда ложно).
     assert sim(3, 0.0) == sim(3, -1.0)
+
+
+def test_trend_assignment_is_stable_across_variants():
+    """
+    Назначение окна трендовым зависит только от seed: группировка окон
+    одинакова при любой toxicity — иначе парное сравнение по группам
+    сравнивало бы разные множества окон.
+    """
+    for seed in range(30):
+        a = sim(seed, 0.2, trend_prob=0.4)["trending"]
+        b = sim(seed, 0.65, trend_prob=0.4)["trending"]
+        assert a == b
+
+
+def test_trend_prob_zero_means_no_trending_windows():
+    assert not any(sim(seed, 0.5, trend_prob=0.0)["trending"] for seed in range(20))
+
+
+def test_trending_windows_starve_pairs_and_grow_residual():
+    """
+    ГЛАВНАЯ ПРОВЕРКА МОДЕЛИ ТРЕНДА: в трендовых окнах доля завершённых пар
+    падает, а непарный остаток растёт. Если это сломалось — тренд перестал
+    быть тем режимом, от которого стратегия должна защищаться, и все
+    сравнения «до/после реакции» теряют смысл.
+    """
+    results = [
+        run_one(300, 0.55, 0.012, 0.02, seed, 0.5, 0.45, D("0"), D("0.01"),
+                0.5, 1.5)
+        for seed in range(80)
+    ]
+    trend = [r for r in results if r["trending"]]
+    calm = [r for r in results if not r["trending"]]
+    assert len(trend) >= 15 and len(calm) >= 15
+
+    import statistics
+    pair_trend = statistics.mean(r["pair_rate"] for r in trend)
+    pair_calm = statistics.mean(r["pair_rate"] for r in calm)
+    res_trend = statistics.mean(r["abs_residual"] for r in trend)
+    res_calm = statistics.mean(r["abs_residual"] for r in calm)
+
+    assert pair_trend < pair_calm * 0.75, (
+        f"доля пар в тренде {pair_trend:.2%} не упала против {pair_calm:.2%}"
+    )
+    assert res_trend > res_calm * 1.15, (
+        f"|остаток| в тренде {res_trend:.1f} не вырос против {res_calm:.1f}"
+    )
 
 
 def test_paired_diff_beats_independent_difference():
