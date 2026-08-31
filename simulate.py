@@ -46,6 +46,7 @@ from statistics import NormalDist
 from src.fair_value import FairValueModel, VolatilityEstimator
 from src.models import Book, BookLevel, MarketPosition, TargetMarket
 from src.quoting import QuoteGenerator
+from src.regime import Regime, RegimeDetector
 
 D = Decimal
 ND = NormalDist()
@@ -61,6 +62,20 @@ class SimStrat:
     allow_directional = True
     directional_min_edge = D("0.025")
     directional_max_net = D("60")
+    regime_trending_response = True
+    regime_volatile_no_quote = True
+    trending_crowded_extra_ticks = 3
+    trending_remove_crowded = False
+    trending_tighten_ticks = 1
+    regime_window_s = 120.0
+    regime_min_fills = 6
+    regime_imbalance_enter = 0.70
+    regime_imbalance_soft = 0.45
+    regime_imbalance_exit = 0.40
+    regime_autocorr_enter = 0.25
+    regime_vol_ratio_enter = 1.8
+    regime_vol_ratio_exit = 1.35
+    regime_min_hold_s = 45.0
 
 
 class SimRisk:
@@ -139,7 +154,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             market_spread: float, seed: int,
             toxicity: float = 0.35, queue_factor: float = 0.45,
             fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01"),
-            trend_prob: float = 0.0, trend_strength: float = 0.0) -> dict:
+            trend_prob: float = 0.0, trend_strength: float = 0.0,
+            use_regime: bool = False) -> dict:
     """Одно торговое окно."""
     # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
     # seed и разной toxicity получают одинаковые базовую траекторию спота,
@@ -158,6 +174,10 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     quoter = QuoteGenerator(SimStrat(), SimRisk())
     fvm = FairValueModel(D("0.35"), D("0.30"), D("0.15"))
     vol = VolatilityEstimator(45.0, 8.0, 0.30)
+    # Детектор режима работает на виртуальном времени симуляции (секунды
+    # шагов). use_regime=False — прогон «до части 3»: реакция выключена.
+    detector = RegimeDetector.from_settings(SimStrat) if use_regime else None
+    regime_seconds = {Regime.TRENDING: 0, Regime.VOLATILE: 0}
 
     spot = strike = 100_000.0
     pos = MarketPosition("sim")
@@ -203,6 +223,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         market.end_ts = 9e18  # seconds_left переопределим вручную ниже
         object.__setattr__(market, "end_ts", __import__("time").time() + left)
 
+        now = float(step)
         # Эволюция спота (GBM).
         dt_y = tick_dt / SECONDS_PER_YEAR
         spot *= math.exp(
@@ -210,6 +231,10 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             + sigma * math.sqrt(dt_y) * rng_path.gauss(0, 1)
         )
         vol.update(spot, step * tick_dt)
+        if detector is not None:
+            detector.on_spot(spot, now)
+            if detector.regime in regime_seconds:
+                regime_seconds[detector.regime] += 1
 
         # Рынок = истинная вероятность + шум.
         p_true = true_probability(spot, strike, left, sigma)
@@ -225,7 +250,10 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             drift_per_second=vol.drift_per_second,
             vol_ready=vol.ready,
         )
-        quotes = quoter.build_quotes(market, fv, pos, yes_book, no_book)
+        regime_state = detector.state() if detector is not None else None
+        quotes = quoter.build_quotes(
+            market, fv, pos, yes_book, no_book, regime_state
+        )
 
         # --- Модель исполнения ------------------------------------------
         # Три эффекта, без которых симуляция врёт в вашу пользу:
@@ -265,6 +293,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             )
             bought[q.outcome] += float(q.size)
             fills += 1
+            if detector is not None:
+                detector.on_fill(q.outcome, "BUY", q.size, now)
 
             # Adverse selection: с вероятностью `toxicity` этот филл был от
             # информированного участника, и цена немедленно уходит против нас.
@@ -294,17 +324,23 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         # Доля купленных shares, закончивших в полной паре (обе ноги пары).
         "pair_rate": (2.0 * pairs_done / total_bought) if total_bought > 0 else 0.0,
         "trending": trending,
+        # Сколько секунд окна детектор провёл в каждом состоянии — чтобы
+        # видеть, что реакция вообще включалась, а не победила вхолостую.
+        "regime_trending_s": regime_seconds[Regime.TRENDING],
+        "regime_volatile_s": regime_seconds[Regime.VOLATILE],
         "fees": float(pos.fees_paid),
         "gas": float(pos.merge_costs),
     }
 
 
-def run_level(args, toxicity: float) -> list[dict]:
+def run_level(args, toxicity: float, use_regime: bool | None = None) -> list[dict]:
     """Прогнать один уровень toxicity на seed'ах 0..runs-1."""
+    if use_regime is None:
+        use_regime = args.regime
     tasks = [
         (args.window, args.sigma, args.noise, args.spread, seed,
          toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas),
-         args.trend_prob, args.trend_strength)
+         args.trend_prob, args.trend_strength, use_regime)
         for seed in range(args.runs)
     ]
     if args.jobs > 1:
@@ -396,6 +432,69 @@ def run_sweep(args, levels: list[float]) -> None:
     print("уровня не отделяется от шума. Это свойство данных, а не ошибка.")
 
 
+def run_regime_compare(args) -> None:
+    """
+    Одни и те же seed'ы, реакция на режим ВЫКЛ против ВКЛ. PnL отдельно по
+    трендовым и спокойным окнам (группировка от seed, у обоих вариантов
+    одинаковая), разности парные. Это и есть ответ на вопрос «стоит ли
+    включать часть 3»: если в спокойных окнах реакция теряет больше, чем
+    выигрывает в трендовых, итог отрицательный — и он будет напечатан
+    так же честно, как положительный.
+    """
+    print(f"Сравнение реакции на режим: {args.runs} прогонов, toxicity "
+          f"{args.toxicity}, тренд {args.trend_prob}/{args.trend_strength}σ")
+    print("-" * 62)
+    base = run_level(args, args.toxicity, use_regime=False)
+    with_regime = run_level(args, args.toxicity, use_regime=True)
+
+    act_t = statistics.mean(
+        r["regime_trending_s"] for r in with_regime if r["trending"]
+    ) if any(r["trending"] for r in with_regime) else 0.0
+    act_c = statistics.mean(
+        r["regime_trending_s"] for r in with_regime if not r["trending"]
+    )
+    print(f"Детектор в TRENDING: {act_t:.0f} с/окно в трендовых, "
+          f"{act_c:.0f} с/окно в спокойных (ложные срабатывания)")
+    print("-" * 62)
+
+    total_diff = None
+    group_diffs: dict[str, tuple[float, float]] = {}
+    for name, selector in (("спокойные", False), ("трендовые", True), ("все", None)):
+        idx = [
+            i for i, r in enumerate(base)
+            if selector is None or r["trending"] == selector
+        ]
+        if not idx:
+            continue
+        off = [base[i]["pnl"] for i in idx]
+        on = [with_regime[i]["pnl"] for i in idx]
+        mean_off, half_off = mean_ci(off)
+        mean_on, _ = mean_ci(on)
+        diff, half = paired_diff_ci(off, on)
+        verdict = "неразличимо" if abs(diff) <= half else (
+            "лучше" if diff > 0 else "ХУЖЕ"
+        )
+        print(f"{name:>9} ({len(idx):4d} окон): без реакции {mean_off:+7.2f}, "
+              f"с реакцией {mean_on:+7.2f}, Δ {diff:+6.2f} ± {half:.2f} ({verdict})")
+        group_diffs[name] = (diff, half)
+        if selector is None:
+            total_diff = (diff, half)
+
+    print("-" * 62)
+    calm = group_diffs.get("спокойные")
+    trend = group_diffs.get("трендовые")
+    if calm and trend and total_diff:
+        if total_diff[0] > total_diff[1]:
+            print("ИТОГ: реакция улучшает суммарный PnL статистически значимо.")
+        elif total_diff[0] < -total_diff[1]:
+            print("ИТОГ: реакция УХУДШАЕТ суммарный PnL — включать не стоит.")
+        else:
+            print("ИТОГ: суммарный эффект статистически неразличим.")
+        if calm[0] < -calm[1]:
+            print("В спокойных окнах реакция значимо ТЕРЯЕТ деньги — смотри,")
+            print("покрывает ли это выигрыш в трендовых (строки выше).")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=200)
@@ -415,6 +514,11 @@ def main() -> None:
                     help="доля окон с направленным дрейфом (0 = чистый GBM)")
     ap.add_argument("--trend-strength", type=float, default=1.5,
                     help="сила дрейфа: ожидаемый лог-ход за окно в сигмах окна")
+    ap.add_argument("--regime", action="store_true",
+                    help="включить реакцию котирования на режим (часть 3)")
+    ap.add_argument("--regime-compare", action="store_true",
+                    help="прогнать реакцию ВЫКЛ против ВКЛ на общих seed'ах "
+                         "с парным сравнением по трендовым/спокойным окнам")
     ap.add_argument("--sweep", type=str, default=None,
                     help="уровни toxicity через запятую (например 0.2,0.35,0.5,0.65): "
                          "прогнать все на общих seed'ах и сравнить парно")
@@ -423,6 +527,10 @@ def main() -> None:
     args = ap.parse_args()
 
     print(__doc__)
+
+    if args.regime_compare:
+        run_regime_compare(args)
+        return
 
     if args.sweep:
         levels = [float(x) for x in args.sweep.split(",") if x.strip()]

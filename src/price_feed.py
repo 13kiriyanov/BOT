@@ -18,6 +18,7 @@ import json
 import logging
 import time
 from decimal import Decimal
+from typing import Callable
 
 import websockets
 from polymarket import AsyncSecureClient
@@ -45,6 +46,8 @@ class SpotFeed:
         self._prices: dict[str, float] = {}
         self._updated: dict[str, float] = {}
         self._vol: dict[str, VolatilityEstimator] = {}
+        # Подписчики на каждый тик (движок кормит ими детектор режима).
+        self._listeners: list[Callable[[str, float, float], None]] = []
         self._cfg = (vol_halflife_s, momentum_halflife_s, float(vol_floor_annual))
         self._stop = asyncio.Event()
 
@@ -71,11 +74,20 @@ class SpotFeed:
         ts = self._updated.get(asset)
         return ts is None or (time.time() - ts) > timeout_s
 
+    def add_listener(self, callback: Callable[[str, float, float], None]) -> None:
+        """Подписаться на тики: callback(asset, price, ts)."""
+        self._listeners.append(callback)
+
     def ingest(self, asset: str, price: float, ts: float | None = None) -> None:
         ts = ts or time.time()
         self._prices[asset] = price
         self._updated[asset] = ts
         self._est(asset).update(price, ts)
+        for callback in self._listeners:
+            try:
+                callback(asset, price, ts)
+            except Exception as exc:  # noqa: BLE001 - слушатель не роняет фид
+                log.error("Слушатель тиков упал: %s", exc)
 
     def stop(self) -> None:
         self._stop.set()

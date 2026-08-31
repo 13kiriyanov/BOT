@@ -71,7 +71,8 @@ def test_balanced_flow_stays_calm():
 def test_trending_hysteresis_holds_between_exit_and_enter():
     """Между exit и enter состояние держится; ниже exit — отпускает."""
     det = RegimeDetector(
-        min_fills=4, imbalance_enter=0.7, imbalance_soft=0.55, imbalance_exit=0.4
+        min_fills=4, imbalance_enter=0.7, imbalance_soft=0.55,
+        imbalance_exit=0.4, min_hold_s=0.0,
     )
     ts = feed_calm_spot(det)
     one_sided_fills(det, ts, n=6)          # imbalance = 1.0 -> TRENDING
@@ -155,6 +156,53 @@ def test_autocorr_accelerates_entry_on_soft_imbalance():
     state = det.state()
     assert 0.5 <= state.imbalance < 0.9
     assert det.regime == Regime.TRENDING
+
+
+def test_min_hold_survives_evidence_starvation():
+    """
+    Реакция котирования душит поток филлов, по которому тренд обнаружен.
+    Минимальное удержание не даёт состоянию осциллировать, а память о
+    заваленной стороне сохраняет направление реакции, даже когда живой
+    знак потока в окне обнулился.
+    """
+    det = RegimeDetector(window_s=30.0, min_fills=4, min_hold_s=60.0)
+    ts = feed_calm_spot(det)
+    one_sided_fills(det, ts, n=5)          # вход, нас засыпает NO
+    assert det.regime == Regime.TRENDING
+
+    # 40 секунд тишины: окно филлов полностью опустело, но удержание
+    # ещё действует — и состояние, и сторона реакции на месте.
+    for i in range(41):
+        det.on_spot(100_000.0, ts + 3 + i)
+    assert det.state().fills_in_window == 0
+    assert det.regime == Regime.TRENDING
+    assert det.state().crowded_side == "NO"
+
+    # После истечения удержания пустое окно отпускает состояние.
+    for i in range(25):
+        det.on_spot(100_000.0, ts + 44 + i)
+    assert det.regime == Regime.CALM
+    assert det.state().crowded_side is None
+
+
+def test_lone_stale_fill_does_not_pin_trending():
+    """
+    Удержание TRENDING тоже требует свидетельств: один доживающий в окне
+    филл (imbalance == 1.0) не должен пиннить состояние после того, как
+    поток кончился.
+    """
+    det = RegimeDetector(window_s=60.0, min_fills=4, min_hold_s=0.0)
+    ts = feed_calm_spot(det)
+    # Пять филлов с интервалом 12 с: входим в TRENDING.
+    for i in range(5):
+        det.on_fill("NO", "BUY", D("20"), ts + i * 12)
+    assert det.regime == Regime.TRENDING
+
+    # Ещё 55 секунд тиков: в окне остаётся один-единственный филл.
+    for i in range(56):
+        det.on_spot(100_000.0, ts + 48 + 1 + i)
+    assert det.state().fills_in_window <= 1
+    assert det.regime == Regime.CALM
 
 
 def test_snapshot_exposes_metrics():

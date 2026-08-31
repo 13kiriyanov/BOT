@@ -108,7 +108,11 @@ class RegimeDetector:
         self,
         *,
         window_s: float = 120.0,
-        min_fills: int = 6,
+        # Минимум филлов в окне для входа в TRENDING. Калибр — собственный
+        # темп бота: при ~20 филлах за 10-минутное окно на 120-секундное
+        # окно приходится 4-6, и порог выше этого делает детектор слепым:
+        # вход случался бы к середине тренда или никогда.
+        min_fills: int = 4,
         imbalance_enter: float = 0.70,
         imbalance_soft: float = 0.45,
         imbalance_exit: float = 0.40,
@@ -125,6 +129,13 @@ class RegimeDetector:
         # до ложных VOLATILE. Дефолт = полупериод медленной EWMA в тиках.
         vol_min_samples: int = 300,
         bar_s: float = 1.0,
+        # Минимальное удержание TRENDING после входа. Реакция котирования
+        # снимает/отодвигает заваленную сторону, то есть ДУШИТ сам поток
+        # филлов, по которому тренд был обнаружен: без удержания детектор
+        # осциллирует «вошёл -> подавил свидетельства -> вышел -> снова
+        # завалило». Удержание разрывает эту петлю на время, за которое
+        # тренд либо подтвердится новыми филлами, либо нет.
+        min_hold_s: float = 45.0,
     ) -> None:
         if not (imbalance_exit <= imbalance_soft <= imbalance_enter):
             raise ValueError("пороги односторонности: exit <= soft <= enter")
@@ -142,6 +153,7 @@ class RegimeDetector:
         self.vol_ratio_exit = vol_ratio_exit
         self.vol_min_samples = vol_min_samples
         self.bar_s = bar_s
+        self.min_hold_s = min_hold_s
 
         # (ts, signed_size): знак — вклад филла в net (+ = копим YES).
         self._fills: deque[tuple[float, float]] = deque()
@@ -149,12 +161,35 @@ class RegimeDetector:
         self._slow = _EwmaVar(vol_slow_halflife_s)
         self._last_price: float | None = None
         self._last_ts: float | None = None
-        # 1-секундные бары для автокорреляции.
+        # 1-секундные бары для автокорреляции. Значение кэшируется и
+        # пересчитывается только при закрытии нового бара: O(N) на каждый
+        # тик превратил бы прогон симулятора из секунд в минуты.
         self._bar_returns: deque[float] = deque(maxlen=autocorr_bars)
         self._bar_open_price: float | None = None
         self._bar_index: int | None = None
+        self._autocorr_cache: float | None = None
+        self._autocorr_dirty = False
 
         self._regime = Regime.CALM
+        self._entered_trending_at: float | None = None
+        # Заваленная сторона на момент входа: пока реакция морит поток,
+        # живой знак может обнулиться, а сторона реакции меняться не должна.
+        self._crowded_hold: Outcome | None = None
+
+    @classmethod
+    def from_settings(cls, s) -> "RegimeDetector":  # noqa: ANN001 - StrategySettings
+        """Собрать детектор из порогов StrategySettings (утиный доступ)."""
+        return cls(
+            window_s=s.regime_window_s,
+            min_fills=s.regime_min_fills,
+            imbalance_enter=s.regime_imbalance_enter,
+            imbalance_soft=s.regime_imbalance_soft,
+            imbalance_exit=s.regime_imbalance_exit,
+            autocorr_enter=s.regime_autocorr_enter,
+            vol_ratio_enter=s.regime_vol_ratio_enter,
+            vol_ratio_exit=s.regime_vol_ratio_exit,
+            min_hold_s=s.regime_min_hold_s,
+        )
 
     # ------------------------------------------------------------ сигналы
 
@@ -165,7 +200,7 @@ class RegimeDetector:
             signed = -signed
         self._fills.append((ts, signed))
         self._prune(ts)
-        self._reevaluate()
+        self._reevaluate(ts)
 
     def on_spot(self, price: float, ts: float) -> None:
         """Учесть тик спота: вола (быстрая/медленная) и бары автокорреляции."""
@@ -185,10 +220,11 @@ class RegimeDetector:
         elif bar != self._bar_index:
             if self._bar_open_price and self._bar_open_price > 0:
                 self._bar_returns.append(math.log(price / self._bar_open_price))
+                self._autocorr_dirty = True
             self._bar_index, self._bar_open_price = bar, price
 
         self._prune(ts)
-        self._reevaluate()
+        self._reevaluate(ts)
 
     # ------------------------------------------------------------ метрики
 
@@ -222,13 +258,16 @@ class RegimeDetector:
     def _autocorr(self) -> float | None:
         if len(self._bar_returns) < self.autocorr_min_bars:
             return None
-        return _autocorr_lag1(list(self._bar_returns))
+        if self._autocorr_dirty or self._autocorr_cache is None:
+            self._autocorr_cache = _autocorr_lag1(list(self._bar_returns))
+            self._autocorr_dirty = False
+        return self._autocorr_cache
 
     # ------------------------------------------------------------ автомат
 
-    def _reevaluate(self) -> None:
+    def _reevaluate(self, now: float) -> None:
         vol = self._vol_ratio()
-        imbalance, fills_n, _ = self._imbalance()
+        imbalance, fills_n, live_side = self._imbalance()
         autocorr = self._autocorr()
 
         # VOLATILE доминирует и удерживается собственным exit-порогом.
@@ -238,6 +277,8 @@ class RegimeDetector:
                     return
             elif vol >= self.vol_ratio_enter:
                 self._regime = Regime.VOLATILE
+                self._entered_trending_at = None
+                self._crowded_hold = None
                 return
 
         trending_now = fills_n >= self.min_fills and (
@@ -250,12 +291,29 @@ class RegimeDetector:
         )
 
         if self._regime == Regime.TRENDING:
-            # Гистерезис: удерживаемся, пока односторонность выше exit.
-            if trending_now or (fills_n > 0 and imbalance > self.imbalance_exit):
+            if live_side is not None:
+                self._crowded_hold = live_side
+            # Минимальное удержание: реакция морит поток-свидетельство,
+            # без него состояние осциллирует (см. комментарий к min_hold_s).
+            entered = self._entered_trending_at
+            if entered is not None and now - entered < self.min_hold_s:
+                return
+            # Гистерезис: удерживаемся, пока односторонность выше exit,
+            # НО удержание тоже требует свидетельств. Один устаревающий
+            # филл держит imbalance=1.0 и без этой планки пиннил бы
+            # TRENDING на минуты после того, как поток кончился.
+            hold_fills = max(2, self.min_fills // 2)
+            if trending_now or (
+                fills_n >= hold_fills and imbalance > self.imbalance_exit
+            ):
                 return
             self._regime = Regime.CALM
+            self._entered_trending_at = None
+            self._crowded_hold = None
         elif trending_now:
             self._regime = Regime.TRENDING
+            self._entered_trending_at = now
+            self._crowded_hold = live_side
         else:
             self._regime = Regime.CALM
 
@@ -267,9 +325,12 @@ class RegimeDetector:
 
     def state(self) -> RegimeState:
         imbalance, fills_n, side = self._imbalance()
+        crowded: Outcome | None = None
+        if self._regime == Regime.TRENDING:
+            crowded = side if side is not None else self._crowded_hold
         return RegimeState(
             regime=self._regime,
-            crowded_side=side if self._regime == Regime.TRENDING else None,
+            crowded_side=crowded,
             imbalance=imbalance,
             fills_in_window=fills_n,
             vol_ratio=self._vol_ratio(),

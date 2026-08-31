@@ -22,6 +22,7 @@ from src.models import (
     shares_to_base_units,
 )
 from src.quoting import QuoteGenerator, round_to_tick
+from src.regime import Regime, RegimeState
 from src.risk import HaltReason, RiskManager
 
 D = Decimal
@@ -39,6 +40,20 @@ class StratCfg:
     allow_directional = True
     directional_min_edge = D("0.025")
     directional_max_net = D("60")
+    regime_trending_response = False  # дефолт конфига: вердикт измерения
+    regime_volatile_no_quote = True
+    trending_crowded_extra_ticks = 3
+    trending_remove_crowded = False
+    trending_tighten_ticks = 1
+    regime_window_s = 120.0
+    regime_min_fills = 6
+    regime_imbalance_enter = 0.70
+    regime_imbalance_soft = 0.45
+    regime_imbalance_exit = 0.40
+    regime_autocorr_enter = 0.25
+    regime_vol_ratio_enter = 1.8
+    regime_vol_ratio_exit = 1.35
+    regime_min_hold_s = 45.0
 
 
 class RiskCfg:
@@ -241,6 +256,138 @@ def test_inventory_skew_direction():
 def test_round_to_tick():
     assert round_to_tick(D("0.4967"), D("0.01")) == D("0.49")
     assert round_to_tick(D("0.5"), D("0.01")) == D("0.50")
+
+
+# --------------------------------------------------------- реакция на режим
+
+
+def regime_state(regime: Regime, crowded=None) -> RegimeState:
+    return RegimeState(
+        regime=regime, crowded_side=crowded, imbalance=0.9,
+        fills_in_window=8, vol_ratio=None, autocorr=None,
+    )
+
+
+def fv_at_half():
+    m = FairValueModel(D("0.35"), D("0"), D("0.15"))
+    return m.compute(
+        spot=100_000, strike=100_000, seconds_left=300, market_mid=D("0.50"),
+        sigma_annual=0.5, drift_per_second=0.0, vol_ready=True,
+    )
+
+
+class TrendingOnCfg(StratCfg):
+    regime_trending_response = True   # тесты реакции включают её явно
+
+
+def test_trending_widens_crowded_and_tightens_starving(market):
+    """
+    TRENDING, нас засыпает NO: NO-бид отодвигается (не подставляемся под
+    вынос), YES-бид подтягивается к рынку (достраивает пары к накопленному).
+    Книги не передаём, чтобы видеть чистый эффект асимметрии.
+    """
+    q = QuoteGenerator(TrendingOnCfg(), RiskCfg())
+    fv = fv_at_half()
+    pos = MarketPosition("0xcond")
+
+    base = {x.outcome: x.price for x in q.build_quotes(market, fv, pos, None, None)}
+    trend = {
+        x.outcome: x.price
+        for x in q.build_quotes(
+            market, fv, pos, None, None,
+            regime_state(Regime.TRENDING, crowded="NO"),
+        )
+    }
+
+    assert trend["NO"] < base["NO"]        # заваленная сторона шире
+    assert trend["YES"] > base["YES"]      # голодная — ближе к рынку
+    # extra >= tighten: сумма пары от асимметрии не растёт.
+    assert trend["YES"] + trend["NO"] <= base["YES"] + base["NO"]
+
+
+def test_trending_asymmetry_keeps_fee_invariant(books):
+    """Асимметрия не имеет права ломать главный инвариант, и с комиссией."""
+    q = QuoteGenerator(TrendingOnCfg(), RiskCfg())
+    fv = fv_at_half()
+    yes_book, no_book = books
+    market = fee_market("0.02")
+
+    for crowded in ("YES", "NO"):
+        quotes = q.build_quotes(
+            market, fv, MarketPosition("0xcond"), yes_book, no_book,
+            regime_state(Regime.TRENDING, crowded=crowded),
+        )
+        if len(quotes) < 2:
+            continue
+        bids = sum(x.price for x in quotes)
+        fee = market.fee_per_pair(quotes[0].price, quotes[1].price)
+        assert bids + fee < StratCfg.max_pair_cost
+
+
+def test_trending_response_flag_off_keeps_symmetry(market):
+    """Реакция отключаема флагом: дефолт StratCfg — выключено."""
+    q = QuoteGenerator(StratCfg(), RiskCfg())   # regime_trending_response=False
+    fv = fv_at_half()
+    pos = MarketPosition("0xcond")
+
+    base = {x.outcome: x.price for x in q.build_quotes(market, fv, pos, None, None)}
+    trend = {
+        x.outcome: x.price
+        for x in q.build_quotes(
+            market, fv, pos, None, None,
+            regime_state(Regime.TRENDING, crowded="NO"),
+        )
+    }
+    assert base == trend
+
+
+def test_trending_remove_crowded_quotes_single_side(market):
+    """Строгий вариант: заваленная сторона снимается, остаётся одна нога."""
+    class RemoveCfg(TrendingOnCfg):
+        trending_remove_crowded = True
+
+    q = QuoteGenerator(RemoveCfg(), RiskCfg())
+    quotes = q.build_quotes(
+        market, fv_at_half(), MarketPosition("0xcond"), None, None,
+        regime_state(Regime.TRENDING, crowded="NO"),
+    )
+    assert len(quotes) == 1
+    assert quotes[0].outcome == "YES" and quotes[0].side == "BUY"
+
+
+def test_volatile_regime_stops_quoting(market):
+    """В VOLATILE не котируем; механизм отключаем своим флагом."""
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    fv = fv_at_half()
+    pos = MarketPosition("0xcond")
+
+    assert q.build_quotes(
+        market, fv, pos, None, None, regime_state(Regime.VOLATILE)
+    ) == []
+
+    class NoGateCfg(StratCfg):
+        regime_volatile_no_quote = False
+
+    q2 = QuoteGenerator(NoGateCfg(), RiskCfg())
+    assert q2.build_quotes(
+        market, fv, pos, None, None, regime_state(Regime.VOLATILE)
+    ) != []
+
+
+def test_trending_without_crowded_side_is_symmetric(market):
+    """Сторона неизвестна (поток обнулился) — асимметрию не применяем."""
+    q = QuoteGenerator(TrendingOnCfg(), RiskCfg())
+    fv = fv_at_half()
+    pos = MarketPosition("0xcond")
+    base = {x.outcome: x.price for x in q.build_quotes(market, fv, pos, None, None)}
+    trend = {
+        x.outcome: x.price
+        for x in q.build_quotes(
+            market, fv, pos, None, None,
+            regime_state(Regime.TRENDING, crowded=None),
+        )
+    }
+    assert base == trend
 
 
 # -------------------------------------------------------------- комиссии

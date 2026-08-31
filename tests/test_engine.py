@@ -55,6 +55,20 @@ class Cfg:
         recover_positions = True
         fallback_fee_rate = D("0.02")
         fallback_min_order_size = D("5")
+        regime_trending_response = False  # дефолт конфига: вердикт измерения
+        regime_volatile_no_quote = True
+        trending_crowded_extra_ticks = 3
+        trending_remove_crowded = False
+        trending_tighten_ticks = 1
+        regime_window_s = 120.0
+        regime_min_fills = 6
+        regime_imbalance_enter = 0.70
+        regime_imbalance_soft = 0.45
+        regime_imbalance_exit = 0.40
+        regime_autocorr_enter = 0.25
+        regime_vol_ratio_enter = 1.8
+        regime_vol_ratio_exit = 1.35
+        regime_min_hold_s = 45.0
 
     class risk:
         max_position_per_side = D("250")
@@ -475,6 +489,24 @@ def test_fill_schedules_markout_measurement():
     assert ev["token"] == "tok_no"
     # Книг в тесте нет — mid недоступен, и это честно отражено, а не выдумано.
     assert ev["markout_0.01s"] is None
+
+
+# ------------------------------------------------------------ режим рынка
+
+
+def test_fill_feeds_regime_detector():
+    """Каждый филл попадает в детектор режима своего актива."""
+    engine = make_engine(FakeClient())
+    engine.markets["0xcond"] = make_market()
+
+    asyncio.run(engine._on_fill(make_fill()))
+
+    detector = engine._regimes["BTC"]
+    assert detector.state().fills_in_window == 1
+
+    # Тики спота через слушателя фида тоже доходят до детектора.
+    engine.spot.ingest("BTC", 100_000.0)
+    assert detector._last_price == 100_000.0
 
 
 # ---------------------------------------------------------- сверка комиссии

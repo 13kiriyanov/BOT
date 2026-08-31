@@ -149,6 +149,43 @@ class StrategySettings(BaseSettings):
     # Merge ради прибыли, равной газу, — это просто сжигание газа.
     merge_min_profit_ratio: Decimal = Decimal("3")
 
+    # --- Режим рынка ---------------------------------------------------------
+    # Детектор (src/regime.py) работает всегда — это только метрики. Флаги
+    # ниже включают РЕАКЦИЮ котирования на его состояние.
+    # В TRENDING полуспред асимметричен: сторона, которую засыпает поток,
+    # отодвигается или снимается, противоположная подтягивается к рынку —
+    # она достраивает пары к уже накопленному инвентарю.
+    # ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО: на 2000 окон с трендами (см. README) эффект
+    # реакции статистически неразличим от нуля в обеих группах окон —
+    # детектор по собственным филлам опаздывает, урон трендового окна
+    # ограничивает риск-лимит net, а не котировки. Включай только после
+    # проверки на своих данных (python simulate.py --regime-compare).
+    regime_trending_response: bool = False
+    # В VOLATILE не котировать вовсе: модель и котировки не успевают.
+    regime_volatile_no_quote: bool = True
+    # Насколько тиков отодвигается сторона, которую выносит поток...
+    trending_crowded_extra_ticks: int = 3
+    # ...или снять её полностью (строже, чем отодвигание).
+    trending_remove_crowded: bool = False
+    # Насколько тиков подтягивается к рынку противоположная сторона.
+    # Не может превышать trending_crowded_extra_ticks: иначе асимметрия
+    # УХУДШАЛА бы сумму пары, а не улучшала.
+    trending_tighten_ticks: int = 1
+    # Пороги детектора. Входные строже выходных — это гистерезис.
+    regime_window_s: float = 120.0
+    # Калибр — собственный темп филлов бота (~4-6 за 120 с): порог выше
+    # делает детектор слепым, вход случается к середине тренда.
+    regime_min_fills: int = 4
+    regime_imbalance_enter: float = 0.70
+    regime_imbalance_soft: float = 0.45
+    regime_imbalance_exit: float = 0.40
+    regime_autocorr_enter: float = 0.25
+    regime_vol_ratio_enter: float = 1.8
+    regime_vol_ratio_exit: float = 1.35
+    # Минимальное удержание TRENDING: реакция сама душит поток филлов,
+    # по которому тренд обнаружен, и без удержания детектор осциллирует.
+    regime_min_hold_s: float = 45.0
+
     # --- Восстановление после рестарта --------------------------------------
     # Читать открытые позиции с биржи при старте. Выключать это значит
     # считать риск-лимиты от нуля, имея на кошельке позицию прошлой сессии.
@@ -251,6 +288,17 @@ class Settings:
                 f"({MIN_GTD_TTL_S} сек): ни один ордер не подпишется. "
                 "Поставь >= минимума или 0 (GTC)."
             )
+        if s.trending_tighten_ticks < 0 or s.trending_crowded_extra_ticks < 0:
+            raise ValueError("Сдвиги котировок в TRENDING не могут быть отрицательными")
+        if s.trending_tighten_ticks > s.trending_crowded_extra_ticks:
+            raise ValueError(
+                "STRAT_TRENDING_TIGHTEN_TICKS > STRAT_TRENDING_CROWDED_EXTRA_TICKS: "
+                "асимметрия увеличивала бы сумму пары вместо того, чтобы уменьшать"
+            )
+        if not (s.regime_imbalance_exit <= s.regime_imbalance_soft <= s.regime_imbalance_enter):
+            raise ValueError("Пороги односторонности: exit <= soft <= enter (гистерезис)")
+        if s.regime_vol_ratio_exit >= s.regime_vol_ratio_enter:
+            raise ValueError("REGIME_VOL_RATIO: порог выхода должен быть ниже порога входа")
 
 
 def load_settings() -> Settings:
