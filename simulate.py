@@ -68,6 +68,12 @@ class SimRisk:
     max_net_exposure = D("120")
 
 
+# Во сколько раз трендовый поток учащает исполнение стороны, которую он
+# выносит, и морит противоположную. Величины условны, как и вся модель
+# исполнения; важен знак эффекта: пары в тренде складываться перестают.
+TREND_FLOW_CROWD = 2.5
+TREND_FLOW_STARVE = 0.3
+
 Z95 = 1.96
 
 
@@ -132,7 +138,8 @@ def make_book(mid: float, spread: float, tick: float = 0.01) -> Book:
 def run_one(window_s: int, sigma: float, market_noise: float,
             market_spread: float, seed: int,
             toxicity: float = 0.35, queue_factor: float = 0.45,
-            fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01")) -> dict:
+            fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01"),
+            trend_prob: float = 0.0, trend_strength: float = 0.0) -> dict:
     """Одно торговое окно."""
     # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
     # seed и разной toxicity получают одинаковые базовую траекторию спота,
@@ -143,10 +150,11 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     # воздействия, — поэтому после первого филла траектории расходятся.
     # Выравнивание частичное (корреляция уровней ~0.3-0.6), и выигрыш
     # тем меньше, чем дальше уровни друг от друга.
-    rng_path = random.Random(seed * 4 + 0)     # GBM-приращения спота
-    rng_market = random.Random(seed * 4 + 1)   # шум цены рынка
-    rng_queue = random.Random(seed * 4 + 2)    # лотерея очереди исполнения
-    rng_tox = random.Random(seed * 4 + 3)      # триггер и величина шока
+    rng_path = random.Random(seed * 8 + 0)     # GBM-приращения спота
+    rng_market = random.Random(seed * 8 + 1)   # шум цены рынка
+    rng_queue = random.Random(seed * 8 + 2)    # лотерея очереди исполнения
+    rng_tox = random.Random(seed * 8 + 3)      # триггер и величина шока
+    rng_trend = random.Random(seed * 8 + 4)    # назначение и направление тренда
     quoter = QuoteGenerator(SimStrat(), SimRisk())
     fvm = FairValueModel(D("0.35"), D("0.30"), D("0.15"))
     vol = VolatilityEstimator(45.0, 8.0, 0.30)
@@ -154,6 +162,30 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     spot = strike = 100_000.0
     pos = MarketPosition("sim")
     tick_dt = 1.0
+
+    # --- Трендовый режим -------------------------------------------------
+    # В доле trend_prob окон спот получает устойчивый снос вместо чистого
+    # GBM: годовой дрейф подобран так, чтобы за окно ожидаемый лог-ход
+    # составил trend_strength сигм самого окна. Назначение и направление
+    # тренда сидят в СВОЁМ потоке случайности: группировка окон на
+    # трендовые/спокойные одинакова при любых toxicity и включённой или
+    # выключенной реакции — парное сравнение по группам корректно.
+    window_years = max(window_s, 1) / SECONDS_PER_YEAR
+    trending = rng_trend.random() < trend_prob
+    trend_dir = 1.0 if rng_trend.random() < 0.5 else -1.0
+    mu_annual = (
+        trend_dir * trend_strength * sigma / math.sqrt(window_years)
+        if trending else 0.0
+    )
+
+    # Тренд — это не только снос цены, но и ОДНОСТОРОННИЙ поток тейкеров.
+    # В аптренде агрессоры покупают YES, то есть снимают YES-аски — а это
+    # наши BUY-NO биды: их выносит, мы копим проигрышную сторону. Наши
+    # YES-биды при этом голодают: продавцов мало. Без этой асимметрии
+    # исполнения тренд в симуляции не мешал бы складывать пары.
+    crowded_outcome = None
+    if trending:
+        crowded_outcome = "NO" if trend_dir > 0 else "YES"
 
     market = TargetMarket(
         condition_id="sim", slug="sim", question="sim",
@@ -165,6 +197,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     )
 
     fills = 0
+    bought = {"YES": 0.0, "NO": 0.0}
     for step in range(window_s):
         left = window_s - step
         market.end_ts = 9e18  # seconds_left переопределим вручную ниже
@@ -172,7 +205,10 @@ def run_one(window_s: int, sigma: float, market_noise: float,
 
         # Эволюция спота (GBM).
         dt_y = tick_dt / SECONDS_PER_YEAR
-        spot *= math.exp(-0.5 * sigma**2 * dt_y + sigma * math.sqrt(dt_y) * rng_path.gauss(0, 1))
+        spot *= math.exp(
+            (mu_annual - 0.5 * sigma**2) * dt_y
+            + sigma * math.sqrt(dt_y) * rng_path.gauss(0, 1)
+        )
         vol.update(spot, step * tick_dt)
 
         # Рынок = истинная вероятность + шум.
@@ -216,12 +252,18 @@ def run_one(window_s: int, sigma: float, market_noise: float,
                 continue
             # Очередь: базовая вероятность низкая, растёт с глубиной прохода.
             prob = min(0.12, through * 2.5) * queue_factor
+            if crowded_outcome is not None:
+                if q.outcome == crowded_outcome:
+                    prob *= TREND_FLOW_CROWD     # эту сторону выносит поток
+                else:
+                    prob *= TREND_FLOW_STARVE    # эта сторона голодает
             if rng_queue.random() >= prob:
                 continue
 
             pos.apply_fill(
                 q.outcome, "BUY", q.price, q.size, market.fee_for(q.price, q.size)
             )
+            bought[q.outcome] += float(q.size)
             fills += 1
 
             # Adverse selection: с вероятностью `toxicity` этот филл был от
@@ -239,13 +281,19 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     won_yes = spot > strike
     settle = pos.yes_size if won_yes else pos.no_size
     cost = pos.total_cost
+    pairs_done = float(pos.merged_pairs + pos.complete_pairs)
     pos.realized_pnl += settle - cost
 
+    total_bought = bought["YES"] + bought["NO"]
     return {
         "pnl": float(pos.realized_pnl),
         "fills": fills,
         "merged": float(pos.merged_pairs),
         "residual_net": float(pos.net),
+        "abs_residual": abs(float(pos.net)),
+        # Доля купленных shares, закончивших в полной паре (обе ноги пары).
+        "pair_rate": (2.0 * pairs_done / total_bought) if total_bought > 0 else 0.0,
+        "trending": trending,
         "fees": float(pos.fees_paid),
         "gas": float(pos.merge_costs),
     }
@@ -255,13 +303,36 @@ def run_level(args, toxicity: float) -> list[dict]:
     """Прогнать один уровень toxicity на seed'ах 0..runs-1."""
     tasks = [
         (args.window, args.sigma, args.noise, args.spread, seed,
-         toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas))
+         toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas),
+         args.trend_prob, args.trend_strength)
         for seed in range(args.runs)
     ]
     if args.jobs > 1:
         with multiprocessing.Pool(args.jobs) as pool:
             return pool.starmap(run_one, tasks, chunksize=25)
     return [run_one(*t) for t in tasks]
+
+
+def group_stats(results: list[dict]) -> str:
+    """Однострочная сводка группы окон: PnL, доля пар, непарный остаток."""
+    if not results:
+        return "нет окон"
+    pnls = [r["pnl"] for r in results]
+    mean, half = mean_ci(pnls)
+    pair_rate = statistics.mean(r["pair_rate"] for r in results)
+    residual = statistics.mean(r["abs_residual"] for r in results)
+    return (f"PnL {mean:+7.2f} ± {half:.2f} | пар {pair_rate:5.1%} | "
+            f"|остаток| {residual:5.1f} | окон {len(results)}")
+
+
+def print_trend_split(results: list[dict]) -> None:
+    """Разрез по трендовым и спокойным окнам."""
+    trend = [r for r in results if r["trending"]]
+    calm = [r for r in results if not r["trending"]]
+    if not trend:
+        return
+    print(f"  спокойные : {group_stats(calm)}")
+    print(f"  трендовые : {group_stats(trend)}")
 
 
 def print_level_report(results: list[dict]) -> None:
@@ -284,8 +355,11 @@ def print_level_report(results: list[dict]) -> None:
     print(f"Лучшее окно         : {max(pnls):+.3f}")
     print(f"Филлов за окно      : {statistics.mean(fills):.1f}")
     print(f"Смержено пар        : {statistics.mean(merged):.1f}")
+    print(f"Доля shares в парах : {statistics.mean([r['pair_rate'] for r in results]):.1%}")
+    print(f"Средний |остаток|   : {statistics.mean([r['abs_residual'] for r in results]):.1f} shares")
     print(f"Комиссии за окно    : {statistics.mean(fees):.3f} USDC")
     print(f"Газ merge за окно   : {statistics.mean(gas):.3f} USDC")
+    print_trend_split(results)
 
 
 def run_sweep(args, levels: list[float]) -> None:
@@ -307,6 +381,7 @@ def run_sweep(args, levels: list[float]) -> None:
         )
         print(f"toxicity {level:4.2f} | PnL {mean:+7.2f} ± {half:.2f} | "
               f"прибыльных {wins:.1%} ± {win_half:.1%}")
+        print_trend_split(results)
 
     print("-" * 62)
     print("Парные разности соседних уровней (общие seed'ы):")
@@ -336,6 +411,10 @@ def main() -> None:
                     help="ставка комиссии рынка (0 = рынок без комиссий)")
     ap.add_argument("--merge-gas", type=str, default="0.01",
                     help="стоимость одной транзакции merge, USDC")
+    ap.add_argument("--trend-prob", type=float, default=0.25,
+                    help="доля окон с направленным дрейфом (0 = чистый GBM)")
+    ap.add_argument("--trend-strength", type=float, default=1.5,
+                    help="сила дрейфа: ожидаемый лог-ход за окно в сигмах окна")
     ap.add_argument("--sweep", type=str, default=None,
                     help="уровни toxicity через запятую (например 0.2,0.35,0.5,0.65): "
                          "прогнать все на общих seed'ах и сравнить парно")
@@ -354,7 +433,8 @@ def main() -> None:
 
     print(f"Прогонов: {args.runs} | окно {args.window}s | sigma {args.sigma} | "
           f"toxicity {args.toxicity} | queue {args.queue} | "
-          f"комиссия {args.fee_rate} | газ merge {args.merge_gas}")
+          f"комиссия {args.fee_rate} | газ merge {args.merge_gas} | "
+          f"тренд {args.trend_prob}/{args.trend_strength}σ")
     print("-" * 62)
     print_level_report(run_level(args, args.toxicity))
     print("-" * 62)
