@@ -29,13 +29,29 @@ from .discovery import MarketDiscovery
 from .execution import OrderManager
 from .fair_value import FairValueModel
 from .logging_setup import log_event
-from .models import ZERO, Book, MarketPosition, Quote, TargetMarket
+from .models import (
+    ONE,
+    POSITION_DECIMALS,
+    ZERO,
+    Book,
+    MarketPosition,
+    Outcome,
+    Quote,
+    RecoveredPosition,
+    TargetMarket,
+    shares_to_base_units,
+)
 from .orderbook import OrderBookManager
 from .price_feed import SpotFeed
 from .quoting import QuoteGenerator
 from .risk import HaltReason, RiskManager
 
 log = logging.getLogger("polybot.engine")
+
+# Сколько раз пробуем прочитать позиции при старте и с какой паузой.
+# Читаем настойчиво: неудача здесь означает остановку торговли.
+RECOVERY_ATTEMPTS = 3
+RECOVERY_RETRY_DELAY_S = 2.0
 
 
 class TradingEngine:
@@ -62,6 +78,13 @@ class TradingEngine:
 
         self.markets: dict[str, TargetMarket] = {}
         self.positions: dict[str, MarketPosition] = {}
+        # Позиции, найденные на бирже при старте, чью сторону (YES/NO) ещё
+        # предстоит подтвердить по token_id найденного рынка.
+        self._recovered_by_token: dict[str, RecoveredPosition] = {}
+        # Ставки комиссии, выученные из реальных филлов: condition_id ->
+        # (rate, exponent). discovery пересоздаёт объекты рынков каждый цикл,
+        # и без этого словаря знание терялось бы через 20 секунд.
+        self._fee_overrides: dict[str, tuple[Decimal, Decimal]] = {}
         self._last_merge = 0.0
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -108,11 +131,15 @@ class TradingEngine:
             min_seconds=self.cfg.strategy.min_seconds_to_expiry,
             max_seconds=self.cfg.strategy.max_seconds_to_expiry,
             max_markets=self.cfg.strategy.max_concurrent_markets,
+            fallback_fee_rate=self.cfg.strategy.fallback_fee_rate,
         )
 
         # На старте снимаем всё, что могло остаться от прошлой сессии.
         if not self.cfg.runtime.dry_run:
             await self.orders.cancel_all()
+
+        # Ордера сняты — но позиции прошлой сессии остались на кошельке.
+        await self._recover_positions()
 
     async def _check_balance(self) -> None:
         try:
@@ -120,6 +147,148 @@ class TradingEngine:
             log.info("Баланс USDC: %s", getattr(bal, "balance", "?"))
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось прочитать баланс: %s", exc)
+
+    # --------------------------------------------- восстановление позиций
+
+    async def _fetch_positions(self) -> list[RecoveredPosition]:
+        """Прочитать открытые позиции кошелька и привести к нашим моделям."""
+        found: list[RecoveredPosition] = []
+        async for p in self.client.list_positions():  # type: ignore[union-attr]
+            rec = RecoveredPosition.from_api(p)
+            if rec is None:
+                continue
+            # Резолвленные рынки — это уже требование к USDC, а не рыночный
+            # риск. Заводить их в лимиты значит навсегда занять нотионал.
+            if rec.redeemable:
+                log.warning(
+                    "Позиция %s (%s shares) резолвлена и ждёт redeem — в учёт не беру",
+                    rec.title or rec.condition_id[:12], rec.size,
+                )
+                continue
+            found.append(rec)
+        return found
+
+    async def _recover_positions(self) -> None:
+        """
+        Завести в локальный учёт позиции, уже открытые на кошельке.
+
+        Бот не единственный источник правды: после рестарта или падения
+        shares прошлой сессии никуда не деваются (ордера мы снимаем, позиции
+        остаются). Пока их нет в учёте, риск-лимиты считаются от нуля,
+        inventory skew котирует так, будто мы нейтральны, а merge не видит
+        уже собранных пар.
+        """
+        if not self.cfg.strategy.recover_positions:
+            log.warning(
+                "STRAT_RECOVER_POSITIONS=false — учёт стартует с нуля, "
+                "лимиты не увидят позиций прошлой сессии"
+            )
+            return
+
+        recovered: list[RecoveredPosition] = []
+        error: Exception | None = None
+        for attempt in range(1, RECOVERY_ATTEMPTS + 1):
+            try:
+                recovered = await self._fetch_positions()
+                error = None
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                log.warning(
+                    "Не удалось прочитать позиции (попытка %d/%d): %s",
+                    attempt, RECOVERY_ATTEMPTS, exc,
+                )
+                await asyncio.sleep(RECOVERY_RETRY_DELAY_S * attempt)
+
+        if error is not None:
+            if self.cfg.runtime.dry_run:
+                log.error("Позиции не прочитаны: %s. В dry run продолжаю.", error)
+                return
+            # Котировать поверх неизвестной позиции опаснее, чем не котировать.
+            self.risk.halt(HaltReason.FATAL, f"позиции не прочитаны: {error}")
+            return
+
+        if not recovered:
+            log.info("Открытых позиций на бирже нет — стартуем с чистого листа")
+            return
+
+        for rec in recovered:
+            if rec.outcome is None:
+                if not rec.token_id:
+                    # Ни ярлыка, ни токена: сторону определить нечем.
+                    log.error(
+                        "Позиция %s (%s shares) без стороны и без token_id — "
+                        "в учёт не попадёт, разберитесь вручную",
+                        rec.title or rec.condition_id[:12], rec.size,
+                    )
+                    continue
+                # Сторону подтвердим по token_id, когда discovery найдёт рынок.
+                self._recovered_by_token[rec.token_id] = rec
+                log.warning(
+                    "Позиция %s (%s shares) без ярлыка стороны — жду рынок",
+                    rec.title or rec.condition_id[:12], rec.size,
+                )
+                continue
+            self._position(rec.condition_id).apply_recovered(
+                rec.outcome, rec.size, rec.avg_price
+            )
+            if rec.token_id:
+                self._recovered_by_token[rec.token_id] = rec
+            log.warning(
+                "ВОССТАНОВЛЕНО: %s | %s %s shares по %s | %s",
+                rec.title or rec.condition_id[:12], rec.outcome, rec.size,
+                rec.avg_price if rec.avg_price is not None else "цена неизвестна, считаю по 1.0",
+                rec.condition_id[:12],
+            )
+
+        total_net = sum((p.net for p in self.positions.values()), ZERO)
+        total_cost = sum((p.total_cost for p in self.positions.values()), ZERO)
+        log.warning(
+            "Итог восстановления: рынков=%d net=%s нотионал=%s. "
+            "Лимиты риска считаются уже с учётом этого.",
+            len(self.positions), total_net, total_cost,
+        )
+        log_event(
+            "recover", markets=len(self.positions), net=total_net, notional=total_cost,
+        )
+
+    def _confirm_recovered(self, market: TargetMarket) -> None:
+        """
+        Подтвердить сторону восстановленных позиций по token_id рынка.
+
+        token_id — единственный надёжный признак стороны. Ярлык `outcome`
+        приходит текстом ('Yes' / 'Up'), и если он разойдётся с token_id,
+        локальный net окажется зеркальным реальности: бот будет «разгружать»
+        позицию, докупая её. Такое расхождение останавливает торговлю.
+        """
+        sides: tuple[tuple[str, Outcome], ...] = (
+            (market.yes_token_id, "YES"),
+            (market.no_token_id, "NO"),
+        )
+        for token, outcome in sides:
+            rec = self._recovered_by_token.pop(token, None)
+            if rec is None:
+                continue
+            if rec.outcome is None:
+                self._position(rec.condition_id).apply_recovered(
+                    outcome, rec.size, rec.avg_price
+                )
+                log.warning(
+                    "[%s] ВОССТАНОВЛЕНО по token_id: %s %s shares",
+                    market.slug, outcome, rec.size,
+                )
+            elif rec.outcome != outcome:
+                log.critical(
+                    "[%s] Ярлык позиции (%s) разошёлся с token_id (%s). "
+                    "Локальный учёт зеркален реальности — останавливаюсь.",
+                    market.slug, rec.outcome, outcome,
+                )
+                self.risk.halt(
+                    HaltReason.FATAL,
+                    f"сторона восстановленной позиции неоднозначна: {market.slug}",
+                )
 
     # ------------------------------------------------------- позиции
 
@@ -129,7 +298,13 @@ class TradingEngine:
         return self.positions[condition_id]
 
     async def _on_fill(
-        self, condition_id: str, token_id: str, side: str, price: Decimal, size: Decimal
+        self,
+        condition_id: str,
+        token_id: str,
+        side: str,
+        price: Decimal,
+        size: Decimal,
+        fee_rate_bps: Decimal | None = None,
     ) -> None:
         """Колбэк из user stream: обновить позицию и риск."""
         market = self.markets.get(condition_id)
@@ -137,10 +312,13 @@ class TradingEngine:
             log.warning("Филл по неизвестному рынку %s", condition_id[:12])
             return
 
+        self._audit_reported_fee(market, fee_rate_bps)
+
         outcome = "YES" if token_id == market.yes_token_id else "NO"
+        fee = market.fee_for(price, size)
         pos = self._position(condition_id)
         before = pos.realized_pnl
-        pos.apply_fill(outcome, side, price, size)  # type: ignore[arg-type]
+        pos.apply_fill(outcome, side, price, size, fee)  # type: ignore[arg-type]
 
         self.risk.record_fill(price, size)
         if pos.realized_pnl != before:
@@ -149,10 +327,56 @@ class TradingEngine:
         pairs = pos.complete_pairs
         basis = pos.pair_cost_basis()
         log.info(
-            "[%s] Позиция: YES=%s NO=%s пар=%s себест.пары=%s net=%s",
+            "[%s] Позиция: YES=%s NO=%s пар=%s себест.пары=%s net=%s%s",
             market.slug, pos.yes_size, pos.no_size, pairs,
             f"{basis:.4f}" if basis else "-", pos.net,
+            f" комиссия={fee:.4f}" if fee > 0 else "",
         )
+
+    def _audit_reported_fee(
+        self, market: TargetMarket, fee_rate_bps: Decimal | None
+    ) -> None:
+        """
+        Сверить нашу модель комиссии с тем, что биржа списала по факту.
+
+        Мы считаем, что taker-only комиссию мейкер не платит, а все наши
+        ордера post_only. Если по нашему филлу пришла ненулевая ставка, а мы
+        заложили ноль — предположение неверно, и каждая следующая пара будет
+        собираться в минус. Поднимаем ставку по факту: спред раздвинется на
+        следующем же цикле котирования.
+        """
+        if fee_rate_bps is None or fee_rate_bps <= 0 or market.fee_rate > 0:
+            return
+        rate = fee_rate_bps / Decimal("10000")
+        log.critical(
+            "[%s] Биржа списала комиссию %s bps, хотя рынок считался для нас "
+            "бесплатным. Ставлю rate=%s и расширяю спред.",
+            market.slug, fee_rate_bps, rate,
+        )
+        market.fee_rate = rate
+        # Точную форму (rate * (p*(1-p))**exp) по одной ставке не восстановить.
+        # Плоская ставка — верхняя граница, ошибка уйдёт в нашу пользу.
+        market.fee_exponent = ZERO
+        self._fee_overrides[market.condition_id] = (rate, ZERO)
+        log_event(
+            "fee_mismatch", condition_id=market.condition_id,
+            slug=market.slug, rate_bps=fee_rate_bps, rate=rate,
+        )
+
+    def _apply_fee_override(self, market: TargetMarket) -> None:
+        """
+        Вернуть рынку ставку комиссии, выученную из реального филла.
+
+        Берём максимум: если расписание рынка объявило ставку выше нашей
+        выученной, верим расписанию — оно про будущее, а филл про прошлое.
+        """
+        override = self._fee_overrides.get(market.condition_id)
+        if override is None:
+            return
+        rate, exponent = override
+        if market.fee_rate < rate:
+            market.fee_rate = rate
+            market.fee_exponent = exponent
 
     # --------------------------------------------------------- циклы
 
@@ -176,10 +400,18 @@ class TradingEngine:
                 for cid in added:
                     m = new_map[cid]
                     log.info(
-                        "[%s] Новый рынок: %s | до экспирации %.0fs | страйк %s",
+                        "[%s] Новый рынок: %s | до экспирации %.0fs | страйк %s | "
+                        "комиссия %s",
                         m.slug, m.asset, m.seconds_left, m.strike,
+                        m.fee_rate if m.fee_rate > 0 else "нет",
                     )
                     self.orders.register_market(cid, m.yes_token_id, m.no_token_id)  # type: ignore[union-attr]
+                    self._confirm_recovered(m)
+
+                # Ставку, выученную из филла, возвращаем на место: объекты
+                # рынков здесь пересоздаются, а знание о комиссии — нет.
+                for m in new_map.values():
+                    self._apply_fee_override(m)
 
                 self.markets = new_map
 
@@ -366,27 +598,46 @@ class TradingEngine:
             if self.cfg.runtime.dry_run or self.risk.is_halted:
                 continue
             try:
+                gas = self.cfg.strategy.merge_gas_cost
                 for cid, pos in list(self.positions.items()):
                     pairs = pos.complete_pairs
                     if pairs < self.cfg.strategy.min_merge_size:
                         continue
-                    amount = int(pairs)
+
+                    basis = pos.pair_cost_basis()
+                    # Без известной себестоимости считаем по худшему
+                    # допустимому случаю: так порог сработает строже.
+                    worst = basis if basis is not None else self.cfg.strategy.max_pair_cost
+                    expected = (ONE - worst) * pairs
+                    if gas > 0 and expected < gas * self.cfg.strategy.merge_min_profit_ratio:
+                        log.debug(
+                            "[%s] Merge отложен: прибыль %.4f не оправдывает газ %.4f",
+                            cid[:12], expected, gas,
+                        )
+                        continue
+
+                    # merge_positions ждёт amount в базовых единицах ERC-1155
+                    # (6 знаков), а не в shares. Передать сюда shares значит
+                    # смержить миллионную долю пачки, заплатив полный газ.
+                    amount = shares_to_base_units(pairs)
                     if amount <= 0:
                         continue
-                    basis = pos.pair_cost_basis()
+                    merged = Decimal(amount) / POSITION_DECIMALS
+
                     log.info(
-                        "MERGE %d пар по %s (себестоимость %s)",
-                        amount, cid[:12], f"{basis:.4f}" if basis else "?",
+                        "MERGE %s пар по %s (себестоимость %s, газ %s)",
+                        merged, cid[:12], f"{basis:.4f}" if basis else "?", gas,
                     )
                     handle = await self.client.merge_positions(  # type: ignore[union-attr]
                         condition_id=cid, amount=amount
                     )
-                    pos.apply_merge(Decimal(amount))
-                    profit = (Decimal("1") - (basis or Decimal("1"))) * amount
+                    before = pos.realized_pnl
+                    pos.apply_merge(merged, gas)
+                    profit = pos.realized_pnl - before
                     self.risk.record_realized(profit)
                     log_event(
-                        "merge", condition_id=cid, pairs=amount,
-                        basis=basis, profit=profit,
+                        "merge", condition_id=cid, pairs=merged, amount=amount,
+                        basis=basis, gas=gas, profit=profit,
                         tx=str(getattr(handle, "transaction_hash", "")),
                     )
             except asyncio.CancelledError:
@@ -414,14 +665,20 @@ class TradingEngine:
             pairs = sum((p.complete_pairs for p in self.positions.values()), ZERO)
             merged = sum((p.merged_pairs for p in self.positions.values()), ZERO)
             net = sum((p.net for p in self.positions.values()), ZERO)
+            fees = sum((p.fees_paid for p in self.positions.values()), ZERO)
+            gas = sum((p.merge_costs for p in self.positions.values()), ZERO)
             log.info(
                 "СТАТУС | рынков=%d ордеров=%d | пар=%s смержено=%s net=%s | "
-                "PnL=%.4f филлов=%d | %s",
+                "PnL=%.4f филлов=%d | комиссии=%.4f газ=%.4f | %s",
                 len(self.markets), self.orders.open_count if self.orders else 0,
                 pairs, merged, net, snap["realized_pnl"], snap["fills"],
+                fees, gas,
                 "HALTED:" + snap["reason"] if snap["halted"] else "OK",
             )
-            log_event("status", **snap, pairs=pairs, merged=merged, net=net)
+            log_event(
+                "status", **snap, pairs=pairs, merged=merged, net=net,
+                fees=fees, merge_gas=gas,
+            )
 
     async def sync_loop(self) -> None:
         """Периодическая сверка ордеров с биржей."""

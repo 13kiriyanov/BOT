@@ -12,7 +12,15 @@ from decimal import Decimal
 import pytest
 
 from src.fair_value import FairValueModel, VolatilityEstimator, _norm_cdf
-from src.models import Book, BookLevel, MarketPosition, TargetMarket
+from src.models import (
+    Book,
+    BookLevel,
+    MarketPosition,
+    RecoveredPosition,
+    TargetMarket,
+    outcome_label,
+    shares_to_base_units,
+)
 from src.quoting import QuoteGenerator, round_to_tick
 from src.risk import HaltReason, RiskManager
 
@@ -60,6 +68,34 @@ def market() -> TargetMarket:
         asset="BTC",
         strike=D("100000"),
     )
+
+
+def fee_market(rate: str, exponent: str = "1") -> TargetMarket:
+    """Тот же рынок, но с включённой комиссией."""
+    return TargetMarket(
+        condition_id="0xcond",
+        slug="bitcoin-up-or-down-fee",
+        question="Bitcoin Up or Down?",
+        yes_token_id="tok_yes",
+        no_token_id="tok_no",
+        end_ts=time.time() + 300,
+        tick_size=D("0.01"),
+        min_order_size=D("5"),
+        neg_risk=False,
+        asset="BTC",
+        strike=D("100000"),
+        fees_enabled=True,
+        fee_rate=D(rate),
+        fee_exponent=D(exponent),
+    )
+
+
+class FakeApiPosition:
+    """Позиция в том виде, в каком её отдаёт SDK (нам важны только поля)."""
+
+    def __init__(self, **fields) -> None:
+        for key, value in fields.items():
+            setattr(self, key, value)
 
 
 @pytest.fixture
@@ -207,6 +243,101 @@ def test_round_to_tick():
     assert round_to_tick(D("0.5"), D("0.01")) == D("0.50")
 
 
+# -------------------------------------------------------------- комиссии
+
+
+def test_fee_per_share_peaks_at_the_money():
+    """Комиссия rate*(p*(1-p))**exp максимальна у 0.50 и падает к краям."""
+    m = fee_market("0.02")
+    assert m.fee_per_share(D("0.50")) > m.fee_per_share(D("0.80"))
+    assert m.fee_per_share(D("0.50")) > m.fee_per_share(D("0.20"))
+    # Рынок без комиссии не берёт ничего ни на одной цене.
+    free = fee_market("0")
+    assert free.fee_per_share(D("0.50")) == D("0")
+
+
+def test_pair_cost_invariant_with_fees(books):
+    """
+    ГЛАВНЫЙ ИНВАРИАНТ НА FEE-РЫНКЕ: биды ПЛЮС комиссия обеих ног всегда
+    ниже max_pair_cost. Без этого пара собирается с отрицательной чистой
+    маржой, и по логам это не видно — там сумма бидов выглядит нормально.
+    """
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    m = FairValueModel(D("0.35"), D("0.3"), D("0.15"))
+    yes_book, no_book = books
+    pos = MarketPosition(condition_id="0xcond")
+
+    for rate in ("0.001", "0.005", "0.01", "0.02"):
+        market = fee_market(rate)
+        for mid in ("0.20", "0.35", "0.50", "0.65", "0.85"):
+            fv = m.compute(
+                spot=100_000, strike=100_000, seconds_left=300,
+                market_mid=D(mid), sigma_annual=0.5,
+                drift_per_second=0.0, vol_ready=True,
+            )
+            quotes = q.build_quotes(market, fv, pos, yes_book, no_book)
+            if not quotes:
+                continue
+            bids = sum(x.price for x in quotes)
+            fee = market.fee_per_pair(quotes[0].price, quotes[1].price)
+            assert bids + fee < StratCfg.max_pair_cost, (
+                f"rate={rate} mid={mid}: биды {bids} + комиссия {fee} >= планки"
+            )
+
+
+def test_fee_market_is_quoted_wider(books):
+    """Комиссия должна раздвигать спред, а не съедать маржу молча."""
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    m = FairValueModel(D("0.35"), D("0"), D("0.15"))
+    yes_book, no_book = books
+    fv = m.compute(
+        spot=100_000, strike=100_000, seconds_left=300, market_mid=D("0.50"),
+        sigma_annual=0.5, drift_per_second=0.0, vol_ready=True,
+    )
+    pos = MarketPosition("0xcond")
+    free = q.build_quotes(fee_market("0"), fv, pos, yes_book, no_book)
+    paid = q.build_quotes(fee_market("0.02"), fv, pos, yes_book, no_book)
+
+    assert free and paid
+    assert sum(x.price for x in paid) < sum(x.price for x in free)
+
+
+def test_prohibitive_fee_stops_quoting(books):
+    """
+    Если комиссия съедает всю планку — не котируем вовсе.
+    Проверка обязана проваливаться в сторону остановки торговли.
+    """
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    m = FairValueModel(D("0.35"), D("0"), D("0.15"))
+    yes_book, no_book = books
+    fv = m.compute(
+        spot=100_000, strike=100_000, seconds_left=300, market_mid=D("0.50"),
+        sigma_annual=0.5, drift_per_second=0.0, vol_ready=True,
+    )
+    # Плоская ставка 0.60 на ногу — дороже любой возможной маржи пары.
+    ruinous = fee_market("0.60", exponent="0")
+    assert q.build_quotes(ruinous, fv, MarketPosition("0xcond"), yes_book, no_book) == []
+
+
+def test_fee_is_capitalized_into_pair_basis():
+    """Комиссия покупки входит в себестоимость пары, а не теряется."""
+    market = fee_market("0.02")
+    pos = MarketPosition("c")
+    for outcome, price in (("YES", D("0.49")), ("NO", D("0.48"))):
+        pos.apply_fill(
+            outcome, "BUY", price, D("100"), market.fee_for(price, D("100"))
+        )
+
+    basis = pos.pair_cost_basis()
+    assert basis is not None
+    # Без комиссии себестоимость была бы ровно 0.97.
+    assert basis > D("0.97")
+    assert basis == pytest.approx(
+        D("0.97") + market.fee_per_pair(D("0.49"), D("0.48")), abs=D("1e-9")
+    )
+    assert pos.fees_paid > 0
+
+
 # --------------------------------------------------------------- позиции
 
 
@@ -232,6 +363,120 @@ def test_partial_pair_leaves_directional_exposure():
     pos.apply_fill("NO", "BUY", D("0.48"), D("40"))
     assert pos.complete_pairs == D("40")
     assert pos.net == D("60")  # голый лонг YES
+
+
+# ---------------------------------------------------------- merge и газ
+
+
+def test_merge_gas_reduces_realized_pnl():
+    """Газ merge — издержка, а не округление: он обязан попасть в PnL."""
+    pos = MarketPosition("c")
+    pos.apply_fill("YES", "BUY", D("0.49"), D("100"))
+    pos.apply_fill("NO", "BUY", D("0.48"), D("100"))
+    pos.apply_merge(D("100"), gas_cost=D("0.35"))
+
+    # 100 пар по 0.97 -> $100 валовых 3.00, минус газ 0.35.
+    assert pos.realized_pnl == pytest.approx(D("2.65"))
+    assert pos.merge_costs == D("0.35")
+
+
+def test_merge_amount_is_in_base_units():
+    """
+    merge_positions() ждёт amount в базовых единицах ERC-1155 (6 знаков),
+    а не в shares. Передать shares значит смержить миллионную долю пачки,
+    заплатив при этом полный газ.
+    """
+    assert shares_to_base_units(D("25")) == 25_000_000
+    assert shares_to_base_units(D("0.5")) == 500_000
+    assert shares_to_base_units(D("0")) == 0
+    assert shares_to_base_units(D("-5")) == 0
+    # Дробь тоньше базовой единицы округляется вниз, а не вверх:
+    # мержить больше, чем есть на балансе, биржа не даст.
+    assert shares_to_base_units(D("1.0000005")) == 1_000_000
+
+
+# ------------------------------------------- восстановление после рестарта
+
+
+def test_recovered_position_enters_risk_base():
+    """
+    Позиция прошлой сессии должна попасть в учёт: иначе лимиты риска
+    считаются от нуля, а бот докупает поверх уже открытой позиции.
+    """
+    pos = MarketPosition("c")
+    pos.apply_recovered("YES", D("100"), D("0.40"))
+
+    assert pos.yes_size == D("100")
+    assert pos.net == D("100")
+    assert pos.total_cost == D("40")
+    # PnL прошлой сессии — не наш результат: дневной лимит убытка
+    # должен отсчитываться от старта.
+    assert pos.realized_pnl == D("0")
+
+    r = RiskManager(RiskCfg())
+    r.heartbeat()
+    assert r.check_global({"c": pos}, 0)          # net 100 < лимита 120
+
+    # Ещё 50 shares с прошлой сессии — и лимит net exposure пробит сразу,
+    # ДО первой собственной сделки. Ровно этого раньше не происходило.
+    pos.apply_recovered("YES", D("50"), D("0.40"))
+    assert not r.check_global({"c": pos}, 0)      # net 150 > лимита 120
+    assert r.state.reason == HaltReason.NET_EXPOSURE
+
+
+def test_recovered_position_without_price_is_conservative():
+    """Нет средней цены — считаем по 1.0: нотионал завышен, лимиты строже."""
+    pos = MarketPosition("c")
+    pos.apply_recovered("NO", D("80"), None)
+    assert pos.no_cost == D("80")
+
+    zero_priced = MarketPosition("c2")
+    zero_priced.apply_recovered("NO", D("80"), D("0"))
+    assert zero_priced.no_cost == D("80")
+
+
+def test_recovered_pairs_are_mergeable():
+    """Восстановленные YES+NO — это готовая пара, её можно сразу мержить."""
+    pos = MarketPosition("c")
+    pos.apply_recovered("YES", D("50"), D("0.49"))
+    pos.apply_recovered("NO", D("50"), D("0.48"))
+    assert pos.complete_pairs == D("50")
+    assert pos.pair_cost_basis() == D("0.97")
+
+
+def test_outcome_label_reads_up_and_down():
+    """Up/Down-серии подписывают исходы не 'Yes'/'No', а 'Up'/'Down'."""
+    assert outcome_label(FakeApiPosition(outcome="Up")) == "YES"
+    assert outcome_label(FakeApiPosition(outcome="Down")) == "NO"
+    assert outcome_label(FakeApiPosition(outcome="Yes")) == "YES"
+    assert outcome_label(FakeApiPosition(outcome="No")) == "NO"
+    # Незнакомый ярлык -> падаем на индекс исхода.
+    assert outcome_label(FakeApiPosition(outcome="???", outcome_index=1)) == "NO"
+    # Нет ни ярлыка, ни индекса -> сторона неизвестна, решим по token_id.
+    assert outcome_label(FakeApiPosition(outcome=None)) is None
+
+
+def test_recovered_position_parsing():
+    """Разбор ответа биржи не должен падать на отсутствующих полях."""
+    rec = RecoveredPosition.from_api(
+        FakeApiPosition(
+            condition_id="0xabc", token_id="tok_yes", size="12.5",
+            avg_price="0.42", outcome="Up", title="BTC Up or Down",
+            redeemable=False,
+        )
+    )
+    assert rec is not None
+    assert (rec.size, rec.avg_price, rec.outcome) == (D("12.5"), D("0.42"), "YES")
+
+    # Пустая позиция и позиция без condition_id в учёт не идут.
+    assert RecoveredPosition.from_api(FakeApiPosition(condition_id="0xabc", size="0")) is None
+    assert RecoveredPosition.from_api(FakeApiPosition(size="10")) is None
+
+    # Резолвленную позицию движок пометит и не станет заводить в лимиты.
+    resolved = RecoveredPosition.from_api(
+        FakeApiPosition(condition_id="0xabc", size="10", redeemable=True)
+    )
+    assert resolved is not None and resolved.redeemable
 
 
 # ------------------------------------------------------------------ риск

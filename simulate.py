@@ -17,9 +17,12 @@
   * adverse selection: часть потока информированная, вас исполняют ровно
     перед движением против вас. ЭТО ГЛАВНЫЙ ФАКТОР УБЫТКОВ.
 
+Комиссии рынка (--fee-rate) и газ merge (--merge-gas) моделируются: первые
+списываются с каждого филла и капитализируются в себестоимость пары, второй
+списывается с каждой транзакции merge.
+
 Чего симулятор НЕ учитывает вовсе:
   * задержки сети, отказы API, частичные исполнения, реджекты;
-  * газ на merge и комиссии рынка;
   * то, что реальная toxicity против розничного бота почти наверняка
     выше 0.5 — вы медленнее всех остальных участников.
 
@@ -90,7 +93,8 @@ def make_book(mid: float, spread: float, tick: float = 0.01) -> Book:
 
 def run_one(window_s: int, sigma: float, market_noise: float,
             market_spread: float, seed: int,
-            toxicity: float = 0.35, queue_factor: float = 0.45) -> dict:
+            toxicity: float = 0.35, queue_factor: float = 0.45,
+            fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01")) -> dict:
     """Одно торговое окно."""
     rng = random.Random(seed)
     quoter = QuoteGenerator(SimStrat(), SimRisk())
@@ -106,6 +110,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         yes_token_id="t_yes", no_token_id="t_no",
         end_ts=0, tick_size=D("0.01"), min_order_size=D("5"),
         neg_risk=False, asset="BTC", strike=D(str(strike)),
+        fees_enabled=fee_rate > 0, fee_rate=fee_rate,
+        fee_exponent=D("1") if fee_rate > 0 else D("0"),
     )
 
     fills = 0
@@ -163,7 +169,9 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             if rng.random() >= prob:
                 continue
 
-            pos.apply_fill(q.outcome, "BUY", q.price, q.size)
+            pos.apply_fill(
+                q.outcome, "BUY", q.price, q.size, market.fee_for(q.price, q.size)
+            )
             fills += 1
 
             # Adverse selection: с вероятностью `toxicity` этот филл был от
@@ -175,7 +183,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
 
         # Периодический merge.
         if step % 20 == 0 and pos.complete_pairs >= 25:
-            pos.apply_merge(pos.complete_pairs)
+            pos.apply_merge(pos.complete_pairs, merge_gas)
 
     # Резолюция остатка.
     won_yes = spot > strike
@@ -188,6 +196,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         "fills": fills,
         "merged": float(pos.merged_pairs),
         "residual_net": float(pos.net),
+        "fees": float(pos.fees_paid),
+        "gas": float(pos.merge_costs),
     }
 
 
@@ -202,21 +212,28 @@ def main() -> None:
                     help="доля информированного потока (adverse selection)")
     ap.add_argument("--queue", type=float, default=0.45,
                     help="доля касаний цены, где вы дошли до головы очереди")
+    ap.add_argument("--fee-rate", type=str, default="0",
+                    help="ставка комиссии рынка (0 = рынок без комиссий)")
+    ap.add_argument("--merge-gas", type=str, default="0.01",
+                    help="стоимость одной транзакции merge, USDC")
     args = ap.parse_args()
 
     print(__doc__)
     print(f"Прогонов: {args.runs} | окно {args.window}s | sigma {args.sigma} | "
-          f"toxicity {args.toxicity} | queue {args.queue}")
+          f"toxicity {args.toxicity} | queue {args.queue} | "
+          f"комиссия {args.fee_rate} | газ merge {args.merge_gas}")
     print("-" * 62)
 
     results = [
         run_one(args.window, args.sigma, args.noise, args.spread, seed,
-                args.toxicity, args.queue)
+                args.toxicity, args.queue, D(args.fee_rate), D(args.merge_gas))
         for seed in range(args.runs)
     ]
     pnls = [r["pnl"] for r in results]
     fills = [r["fills"] for r in results]
     merged = [r["merged"] for r in results]
+    fees = [r["fees"] for r in results]
+    gas = [r["gas"] for r in results]
 
     mean = statistics.mean(pnls)
     stdev = statistics.pstdev(pnls) or 1e-9
@@ -231,6 +248,8 @@ def main() -> None:
     print(f"Лучшее окно         : {max(pnls):+.3f}")
     print(f"Филлов за окно      : {statistics.mean(fills):.1f}")
     print(f"Смержено пар        : {statistics.mean(merged):.1f}")
+    print(f"Комиссии за окно    : {statistics.mean(fees):.3f} USDC")
+    print(f"Газ merge за окно   : {statistics.mean(gas):.3f} USDC")
     print("-" * 62)
     print("НАПОМИНАНИЕ: это верхняя граница. Прогоните --toxicity 0.5 и 0.65,")
     print("чтобы увидеть, как быстро стратегия уходит в минус. Реальная")

@@ -95,6 +95,16 @@ class StrategySettings(BaseSettings):
     # Не котируем, если суммарная глубина топ-3 уровней меньше (shares).
     min_book_depth: Decimal = Decimal("50")
 
+    # --- Комиссии рынка -----------------------------------------------------
+    # У части рынков fees_enabled=true. Ставку и экспоненту бот читает из
+    # расписания комиссий рынка; комиссия вычитается из маржи пары, то есть
+    # спред автоматически раздвигается. Эта ставка используется ТОЛЬКО как
+    # запасная: рынок объявил комиссии, но расписание не отдал. Занижать её
+    # опасно — котирование с отрицательной чистой маржой по логам не видно.
+    # При 0.02 комиссия пары у 0.50 равна ~1 центу, то есть съедает почти всю
+    # валовую маржу дефолтного target_pair_cost: такие рынки бот пропустит.
+    fallback_fee_rate: Decimal = Decimal("0.02")
+
     # --- Fair value модель --------------------------------------------------
     # Вес модели против рыночного mid. 0 = чистый MM по рынку, 1 = чистая модель.
     model_weight: Decimal = Decimal("0.35")
@@ -129,6 +139,18 @@ class StrategySettings(BaseSettings):
     min_merge_size: Decimal = Decimal("25")
     # Не чаще, чем раз в N секунд.
     merge_interval_s: float = 20.0
+    # Стоимость одной транзакции merge, USDC. У proxy-кошелька Polymarket
+    # merge идёт через relayer, газ платит он — тогда ставь 0. При торговле
+    # с EOA транзакция своя, и газ реальный.
+    merge_gas_cost: Decimal = Decimal("0.01")
+    # Мержим, только если ожидаемая прибыль пачки больше газа во столько раз.
+    # Merge ради прибыли, равной газу, — это просто сжигание газа.
+    merge_min_profit_ratio: Decimal = Decimal("3")
+
+    # --- Восстановление после рестарта --------------------------------------
+    # Читать открытые позиции с биржи при старте. Выключать это значит
+    # считать риск-лимиты от нуля, имея на кошельке позицию прошлой сессии.
+    recover_positions: bool = True
 
     # --- Цикл ---------------------------------------------------------------
     # Период пересчёта котировок (сек). Ниже 0.15 упрёшься в rate limit.
@@ -211,6 +233,14 @@ class Settings:
             raise ValueError("STRAT_DIRECTIONAL_MAX_NET больше RISK_MAX_NET_EXPOSURE")
         if s.min_seconds_to_expiry >= s.max_seconds_to_expiry:
             raise ValueError("min_seconds_to_expiry должен быть < max_seconds_to_expiry")
+        if not (Decimal("0") <= s.fallback_fee_rate <= Decimal("0.10")):
+            raise ValueError("STRAT_FALLBACK_FEE_RATE вне разумного диапазона 0..0.10")
+        if s.merge_gas_cost < 0:
+            raise ValueError("STRAT_MERGE_GAS_COST не может быть отрицательным")
+        if s.merge_min_profit_ratio < Decimal("1"):
+            raise ValueError(
+                "STRAT_MERGE_MIN_PROFIT_RATIO < 1 — merge будет стоить дороже прибыли"
+            )
 
 
 def load_settings() -> Settings:
