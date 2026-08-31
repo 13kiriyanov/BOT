@@ -20,7 +20,7 @@ pytest.importorskip("polymarket", reason="engine импортирует типы
 
 from src import engine as engine_mod  # noqa: E402
 from src.engine import TradingEngine  # noqa: E402
-from src.models import MarketPosition, TargetMarket  # noqa: E402
+from src.models import Fill, MarketPosition, TargetMarket  # noqa: E402
 from src.risk import HaltReason  # noqa: E402
 
 D = Decimal
@@ -108,6 +108,20 @@ def make_engine(client: FakeClient) -> TradingEngine:
     engine = TradingEngine(Cfg())  # type: ignore[arg-type]
     engine.client = client  # type: ignore[assignment]
     return engine
+
+
+def make_fill(**overrides) -> Fill:
+    fields = dict(
+        trade_id="t1",
+        condition_id="0xcond",
+        token_id="tok_yes",
+        side="BUY",
+        price=D("0.49"),
+        size=D("10"),
+        fee_rate_bps=None,
+    )
+    fields.update(overrides)
+    return Fill(**fields)  # type: ignore[arg-type]
 
 
 def make_market(**overrides) -> TargetMarket:
@@ -339,11 +353,7 @@ def test_reported_fee_overrides_free_market_assumption():
     engine.markets["0xcond"] = market
     assert market.fee_rate == D("0")
 
-    asyncio.run(
-        engine._on_fill(
-            "0xcond", "tok_yes", "BUY", D("0.49"), D("10"), Decimal("20")
-        )
-    )
+    asyncio.run(engine._on_fill(make_fill(fee_rate_bps=Decimal("20"))))
 
     assert market.fee_rate == D("0.002")          # 20 bps
     # Форму комиссии по одной ставке не восстановить, поэтому ставка плоская:
@@ -362,11 +372,7 @@ def test_learned_fee_survives_market_rediscovery():
     """
     engine = make_engine(FakeClient())
     engine.markets["0xcond"] = make_market()
-    asyncio.run(
-        engine._on_fill(
-            "0xcond", "tok_yes", "BUY", D("0.49"), D("10"), Decimal("20")
-        )
-    )
+    asyncio.run(engine._on_fill(make_fill(fee_rate_bps=Decimal("20"))))
 
     # Тот же рынок, заново собранный discovery: ставка снова нулевая.
     fresh = make_market()
@@ -387,11 +393,7 @@ def test_reported_fee_does_not_downgrade_known_rate():
     market = make_market(fees_enabled=True, fee_rate=D("0.02"), fee_exponent=D("1"))
     engine.markets["0xcond"] = market
 
-    asyncio.run(
-        engine._on_fill(
-            "0xcond", "tok_yes", "BUY", D("0.49"), D("10"), Decimal("1")
-        )
-    )
+    asyncio.run(engine._on_fill(make_fill(fee_rate_bps=Decimal("1"))))
 
     assert market.fee_rate == D("0.02")
     assert market.fee_exponent == D("1")

@@ -21,6 +21,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .models import MIN_GTD_TTL_S
+
 
 class WalletSettings(BaseSettings):
     """Реквизиты кошелька и API-доступа Polymarket."""
@@ -157,8 +159,10 @@ class StrategySettings(BaseSettings):
     quote_interval_s: float = 0.35
     # Перевыставляем ордер, только если цена сдвинулась больше чем на N тиков.
     requote_threshold_ticks: int = 1
-    # TTL для GTD-ордеров (сек). 0 = использовать GTC.
-    order_ttl_s: int = 60
+    # TTL для GTD-ордеров (сек). 0 = использовать GTC. Биржа не принимает
+    # GTD с expiration ближе, чем now + 180 секунд, поэтому минимум — 210
+    # (см. MIN_GTD_TTL_S в models.py). Значение ниже валидация отвергает.
+    order_ttl_s: int = 240
 
 
 class RiskSettings(BaseSettings):
@@ -240,6 +244,12 @@ class Settings:
         if s.merge_min_profit_ratio < Decimal("1"):
             raise ValueError(
                 "STRAT_MERGE_MIN_PROFIT_RATIO < 1 — merge будет стоить дороже прибыли"
+            )
+        if 0 < s.order_ttl_s < MIN_GTD_TTL_S:
+            raise ValueError(
+                f"STRAT_ORDER_TTL_S={s.order_ttl_s} ниже биржевого минимума GTD "
+                f"({MIN_GTD_TTL_S} сек): ни один ордер не подпишется. "
+                "Поставь >= минимума или 0 (GTC)."
             )
 
 

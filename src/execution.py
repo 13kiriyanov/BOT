@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from decimal import Decimal
 from typing import Awaitable, Callable
 
@@ -25,19 +25,23 @@ from polymarket import AsyncSecureClient
 from polymarket.streams import UserSpec
 
 from .logging_setup import log_event
-from .models import ZERO, LiveOrder, Quote
+from .models import MIN_GTD_TTL_S, ZERO, Fill, LiveOrder, Quote
 
 log = logging.getLogger("polybot.exec")
 
-FillCallback = Callable[
-    [str, str, str, Decimal, Decimal, Decimal | None], Awaitable[None]
-]
-"""(condition_id, token_id, side, price, size, fee_rate_bps)
+FillCallback = Callable[[Fill], Awaitable[None]]
+"""Колбэк на каждый НАШ филл, уже приведённый к нашей перспективе."""
 
-fee_rate_bps — ставка, которую биржа реально применила к филлу, или None,
-если она её не прислала. Нужна, чтобы поймать расхождение нашей модели
-комиссий с действительностью.
-"""
+# Сколько последних trade id держим для дедупликации. User-stream шлёт
+# отдельное событие на каждую смену статуса трейда (MATCHED -> MINED ->
+# CONFIRMED) и может повторить историю после переподключения — без дедупа
+# каждый филл задваивается или затраивается.
+SEEN_TRADES_MAX = 4096
+
+# Сколько своих order id помним. Нужно больше, чем живых ордеров: order-
+# событие со статусом MATCHED может снять ордер с учёта РАНЬШЕ, чем придёт
+# trade-событие, и атрибуция по живым ордерам провалилась бы.
+KNOWN_ORDERS_MAX = 4096
 
 
 class RateLimiter:
@@ -74,6 +78,13 @@ class OrderManager:
         self.client = client
         self.dry_run = dry_run
         self.requote_ticks = requote_threshold_ticks
+        if 0 < order_ttl_s < MIN_GTD_TTL_S:
+            log.warning(
+                "order_ttl_s=%d ниже минимума GTD у биржи — поднимаю до %d "
+                "(0 = GTC, если TTL не нужен)",
+                order_ttl_s, MIN_GTD_TTL_S,
+            )
+            order_ttl_s = MIN_GTD_TTL_S
         self.order_ttl_s = order_ttl_s
         self.on_fill = on_fill
 
@@ -83,6 +94,10 @@ class OrderManager:
         self._by_id: dict[str, tuple[str, str]] = {}
         # token_id -> condition_id, чтобы филлы попадали в нужную позицию.
         self._token_market: dict[str, str] = {}
+        # LRU всех своих order id (живых и недавно снятых) — для атрибуции
+        # trade-событий, и LRU обработанных trade id — для дедупликации.
+        self._known_orders: OrderedDict[str, None] = OrderedDict()
+        self._seen_trades: OrderedDict[str, None] = OrderedDict()
 
         self._post_limiter = RateLimiter(rate=25, per=1.0)
         self._cancel_limiter = RateLimiter(rate=25, per=1.0)
@@ -109,6 +124,27 @@ class OrderManager:
     def _track(self, order: LiveOrder) -> None:
         self._live[(order.token_id, order.side)] = order
         self._by_id[order.order_id] = (order.token_id, order.side)
+        self._remember_order(order.order_id)
+
+    def _remember_order(self, order_id: str) -> None:
+        if not order_id:
+            return
+        self._known_orders[order_id] = None
+        self._known_orders.move_to_end(order_id)
+        while len(self._known_orders) > KNOWN_ORDERS_MAX:
+            self._known_orders.popitem(last=False)
+
+    def _remember_trade(self, trade_id: str) -> bool:
+        """True, если trade id уже видели (дубль). Иначе запоминает его."""
+        if not trade_id:
+            return False  # без id дедупликация невозможна — обрабатываем
+        if trade_id in self._seen_trades:
+            self._seen_trades.move_to_end(trade_id)
+            return True
+        self._seen_trades[trade_id] = None
+        while len(self._seen_trades) > SEEN_TRADES_MAX:
+            self._seen_trades.popitem(last=False)
+        return False
 
     def _untrack(self, order_id: str) -> None:
         key = self._by_id.pop(order_id, None)
@@ -306,30 +342,112 @@ class OrderManager:
                     self._untrack(oid)
 
         elif etype == "trade":
-            token = str(getattr(payload, "token_id", ""))
+            status = str(getattr(payload, "status", "")).upper()
+            # Учитываем трейд один раз по первому валидному статусу. FAILED
+            # после уже учтённого MATCHED здесь не откатывается — это ловит
+            # периодическая сверка позиций с биржей.
+            if status not in ("MATCHED", "CONFIRMED", "MINED", "SUCCESS", ""):
+                return
+
+            trade_id = str(getattr(payload, "id", "") or "")
+            if self._remember_trade(trade_id):
+                log.debug("Дубль trade-события %s (%s) — пропускаю", trade_id[:16], status)
+                return
+
+            fills = self._extract_own_fills(payload, trade_id)
+            if not fills:
+                # Ни одна нога трейда не наша по известным order id. Не
+                # бронируем ничего: верхнеуровневые side/price — тейкерские,
+                # и учесть их «как есть» значит рискнуть перевернуть знак
+                # позиции. Расхождение подберёт сверка позиций.
+                log.error(
+                    "Трейд %s не атрибуцирован ни одному нашему ордеру — "
+                    "НЕ учитываю (сверка позиций скорректирует)", trade_id[:16],
+                )
+                log_event("fill_unattributed", trade_id=trade_id, status=status)
+                return
+
+            for fill in fills:
+                log.info(
+                    "ФИЛЛ: %s %s @ %s (%s)",
+                    fill.side, fill.size, fill.price, fill.token_id[:10],
+                )
+                log_event(
+                    "fill", trade_id=fill.trade_id, token=fill.token_id,
+                    side=fill.side, price=fill.price, size=fill.size,
+                    condition_id=fill.condition_id, status=status,
+                    fee_rate_bps=fill.fee_rate_bps,
+                )
+                if self.on_fill and fill.condition_id:
+                    await self.on_fill(fill)
+
+    def _extract_own_fills(self, payload, trade_id: str) -> list[Fill]:  # noqa: ANN001
+        """
+        Достать из trade-события НАШИ ноги.
+
+        Формат user-канала описывает трейд с точки зрения тейкера:
+        верхнеуровневые side/price/size — его. Мы котируем только
+        post_only, то есть всегда мейкер, и наша нога лежит в maker_orders —
+        со СВОИМИ side, price (цена нашего лимитника) и matched_amount.
+        Атрибуцируем по order id; поле trader_side оставлено как страховка
+        на случай, если мы каким-то образом оказались тейкером.
+        """
+        fills: list[Fill] = []
+
+        for mo in getattr(payload, "maker_orders", None) or ():
+            order_id = str(getattr(mo, "order_id", "") or "")
+            if not order_id or order_id not in self._known_orders:
+                continue
+            token = str(getattr(mo, "token_id", "") or "")
+            side = str(getattr(mo, "side", "")).upper()
+            price = Decimal(str(getattr(mo, "price", "0")))
+            size = Decimal(str(getattr(mo, "matched_amount", "0")))
+            raw_fee = getattr(mo, "fee_rate_bps", None)
+            if not token or side not in ("BUY", "SELL") or size <= 0:
+                continue
+            fills.append(
+                Fill(
+                    trade_id=trade_id,
+                    condition_id=self._token_market.get(token, ""),
+                    token_id=token,
+                    side=side,  # type: ignore[arg-type]
+                    price=price,
+                    size=size,
+                    fee_rate_bps=Decimal(str(raw_fee)) if raw_fee is not None else None,
+                )
+            )
+        if fills:
+            return fills
+
+        # Тейкерская ветка: с post_only сюда попадать не должны, но если
+        # taker_order_id наш — верхнеуровневые поля описывают именно нас.
+        taker_order_id = str(getattr(payload, "taker_order_id", "") or "")
+        trader_side = str(getattr(payload, "trader_side", "") or "").upper()
+        if taker_order_id in self._known_orders or trader_side == "TAKER":
+            token = str(getattr(payload, "token_id", "") or "")
             side = str(getattr(payload, "side", "")).upper()
             price = Decimal(str(getattr(payload, "price", "0")))
             size = Decimal(str(getattr(payload, "size", "0")))
-            status = str(getattr(payload, "status", "")).upper()
-
-            # Учитываем только подтверждённые трейды, иначе задвоим позицию.
-            if status not in ("MATCHED", "CONFIRMED", "MINED", "SUCCESS", ""):
-                return
-            if size <= 0 or not token:
-                return
-
-            raw_fee_bps = getattr(payload, "fee_rate_bps", None)
-            fee_rate_bps = Decimal(str(raw_fee_bps)) if raw_fee_bps is not None else None
-
-            condition_id = self._token_market.get(token, "")
-            log.info("ФИЛЛ: %s %s @ %s (%s)", side, size, price, token[:10])
-            log_event(
-                "fill", token=token, side=side, price=price,
-                size=size, condition_id=condition_id, status=status,
-                fee_rate_bps=fee_rate_bps,
-            )
-            if self.on_fill and condition_id:
-                await self.on_fill(condition_id, token, side, price, size, fee_rate_bps)
+            raw_fee = getattr(payload, "fee_rate_bps", None)
+            if token and side in ("BUY", "SELL") and size > 0:
+                log.warning(
+                    "Мы оказались ТЕЙКЕРОМ в трейде %s — при post_only такого "
+                    "быть не должно", trade_id[:16],
+                )
+                fills.append(
+                    Fill(
+                        trade_id=trade_id,
+                        condition_id=self._token_market.get(token, ""),
+                        token_id=token,
+                        side=side,  # type: ignore[arg-type]
+                        price=price,
+                        size=size,
+                        fee_rate_bps=(
+                            Decimal(str(raw_fee)) if raw_fee is not None else None
+                        ),
+                    )
+                )
+        return fills
 
     async def run_user_stream(self) -> None:
         """Слушает свои ордера и трейды. Без этого бот слеп к своим филлам."""
@@ -376,6 +494,7 @@ class OrderManager:
                 key = (order.token_id, order.side)
                 found[key] = order
                 by_id[order.order_id] = key
+                self._remember_order(order.order_id)
 
             if len(found) != len(self._live):
                 log.warning(

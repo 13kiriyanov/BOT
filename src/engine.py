@@ -34,6 +34,7 @@ from .models import (
     POSITION_DECIMALS,
     ZERO,
     Book,
+    Fill,
     MarketPosition,
     Outcome,
     Quote,
@@ -85,6 +86,9 @@ class TradingEngine:
         # (rate, exponent). discovery пересоздаёт объекты рынков каждый цикл,
         # и без этого словаря знание терялось бы через 20 секунд.
         self._fee_overrides: dict[str, tuple[Decimal, Decimal]] = {}
+        # Момент последнего филла или merge по рынку: сверка позиций не
+        # трогает рынки со свежей активностью (data-api отстаёт от CLOB).
+        self._last_activity: dict[str, float] = {}
         self._last_merge = 0.0
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -144,7 +148,11 @@ class TradingEngine:
     async def _check_balance(self) -> None:
         try:
             bal = await self.client.get_balance_allowance(asset_type="COLLATERAL")  # type: ignore[union-attr]
-            log.info("Баланс USDC: %s", getattr(bal, "balance", "?"))
+            raw = getattr(bal, "balance", None)
+            # BalanceAllowance.balance приходит в базовых единицах (6 знаков),
+            # а не в USDC: без деления лог врёт в миллион раз.
+            human = Decimal(raw) / POSITION_DECIMALS if raw is not None else "?"
+            log.info("Баланс USDC: %s", human)
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось прочитать баланс: %s", exc)
 
@@ -297,30 +305,23 @@ class TradingEngine:
             self.positions[condition_id] = MarketPosition(condition_id=condition_id)
         return self.positions[condition_id]
 
-    async def _on_fill(
-        self,
-        condition_id: str,
-        token_id: str,
-        side: str,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: Decimal | None = None,
-    ) -> None:
+    async def _on_fill(self, fill: Fill) -> None:
         """Колбэк из user stream: обновить позицию и риск."""
-        market = self.markets.get(condition_id)
+        market = self.markets.get(fill.condition_id)
         if market is None:
-            log.warning("Филл по неизвестному рынку %s", condition_id[:12])
+            log.warning("Филл по неизвестному рынку %s", fill.condition_id[:12])
             return
 
-        self._audit_reported_fee(market, fee_rate_bps)
+        self._audit_reported_fee(market, fill.fee_rate_bps)
 
-        outcome = "YES" if token_id == market.yes_token_id else "NO"
-        fee = market.fee_for(price, size)
-        pos = self._position(condition_id)
+        outcome: Outcome = "YES" if fill.token_id == market.yes_token_id else "NO"
+        fee = market.fee_for(fill.price, fill.size)
+        pos = self._position(fill.condition_id)
         before = pos.realized_pnl
-        pos.apply_fill(outcome, side, price, size, fee)  # type: ignore[arg-type]
+        pos.apply_fill(outcome, fill.side, fill.price, fill.size, fee)
+        self._last_activity[fill.condition_id] = time.time()
 
-        self.risk.record_fill(price, size)
+        self.risk.record_fill(fill.price, fill.size)
         if pos.realized_pnl != before:
             self.risk.record_realized(pos.realized_pnl - before)
 
@@ -633,6 +634,7 @@ class TradingEngine:
                     )
                     before = pos.realized_pnl
                     pos.apply_merge(merged, gas)
+                    self._last_activity[cid] = time.time()
                     profit = pos.realized_pnl - before
                     self.risk.record_realized(profit)
                     log_event(
