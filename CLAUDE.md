@@ -50,6 +50,13 @@ side/price/size — его; наша мейкерская нога лежит в
 филл значит перевернуть знак позиции. Разбор — только через
 `_extract_own_fills` в `execution.py`.
 
+**`merge_positions()` — не оптимизация, а суть стратегии.** Он превращает
+пару YES+NO обратно в $1 USDC не дожидаясь резолюции. Без него капитал
+заморожен до конца окна и бот делает 1–2 круга вместо десятков.
+
+**Нет тестнета.** У Polymarket нет sandbox и paper-trading. Проверка логики —
+только через `simulate.py` и `DRY_RUN=true`.
+
 ## Единицы на границе с SDK
 
 Баг «не те единицы» не падает — он молча делает не то. Каждый вызов
@@ -68,13 +75,6 @@ side/price/size — его; наша мейкерская нога лежит в
 | `get_balance_allowance()` → balance | БАЗОВЫЕ единицы (int) | `test_balance_allowance_is_base_units_not_usdc` |
 | user-stream trade → price/size | человеческие; верхний уровень — тейкер, наша нога в maker_orders | `test_user_trade_payload_units_and_maker_shape` |
 
-**`merge_positions()` — не оптимизация, а суть стратегии.** Он превращает
-пару YES+NO обратно в $1 USDC не дожидаясь резолюции. Без него капитал
-заморожен до конца окна и бот делает 1–2 круга вместо десятков.
-
-**Нет тестнета.** У Polymarket нет sandbox и paper-trading. Проверка логики —
-только через `simulate.py` и `DRY_RUN=true`.
-
 ## Карта модулей
 
 | Файл | Ответственность |
@@ -82,8 +82,9 @@ side/price/size — его; наша мейкерская нога лежит в
 | `src/quoting.py` | ЯДРО. Генерация котировок, inventory skew, размеры |
 | `src/fair_value.py` | GBM-модель, EWMA волатильность и momentum |
 | `src/risk.py` | Лимиты, kill switch, dead-man switch |
-| `src/execution.py` | Ордера: diff-based cancel/replace, батчи, филлы |
-| `src/engine.py` | Оркестрация 9 asyncio-задач |
+| `src/execution.py` | Ордера: cancel/replace, атрибуция ног трейда, дедуп |
+| `src/markout.py` | Mark-out: adverse selection по филлам (paired/solo) |
+| `src/engine.py` | Оркестрация 10 asyncio-задач |
 | `src/discovery.py` | Поиск рынков + калибровка страйка (3 стратегии) |
 | `src/orderbook.py` | Локальное зеркало стаканов через WS |
 | `src/price_feed.py` | Спот BTC/ETH: RTDS Polymarket или Binance |
@@ -97,10 +98,12 @@ pytest tests/ -v
 python simulate.py --runs 150 --toxicity 0.5
 ```
 
-Тесты разложены по двум файлам: `tests/test_strategy.py` — чистая логика
-(модель, котирование, риск, учёт), `tests/test_engine.py` — движок на
-заглушке клиента (восстановление позиций, экономика merge). Второй файл
-требует установленного пакета `polymarket`; без него он пропускается.
+Тесты разложены по файлам: `tests/test_strategy.py` — чистая логика
+(модель, котирование, риск, учёт); `tests/test_markout.py` и
+`tests/test_simulate.py` — тоже без SDK. `tests/test_engine.py` (движок на
+заглушке клиента), `tests/test_execution.py` (user-stream) и
+`tests/test_units.py` (канарейки единиц) требуют установленного пакета
+`polymarket`; без него они пропускаются.
 
 Если добавляешь логику стратегии — добавь тест на её инвариант. Если меняешь
 риск-лимиты — проверь, что кросс-валидация в `Settings._validate_cross()`
@@ -128,3 +131,6 @@ python simulate.py --runs 150 --toxicity 0.5
    не автоматизирован.
 4. `_place_bid` содержит мёртвую ветку: `min(price, max(price, improved))`
    тождественно равно `price`. Поведение задаётся следующей строкой.
+5. Сверка позиций пропускает рынки с активностью моложе 90 с (data-api
+   отстаёт от CLOB). На непрерывно торгуемом рынке она срабатывает только
+   в паузах; дрейф в часы плотного потока ловится позже, а не сразу.
