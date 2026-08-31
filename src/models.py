@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Literal
 
 Side = Literal["BUY", "SELL"]
@@ -12,6 +12,18 @@ Outcome = Literal["YES", "NO"]
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
+
+# CTF-позиции на Polygon хранятся как ERC-1155 с 6 знаками после запятой.
+# merge_positions() в SDK ждёт amount ИМЕННО в этих базовых единицах и
+# сверяет его с балансом токенов on-chain, а не в shares.
+POSITION_DECIMALS = Decimal("1000000")
+
+
+def shares_to_base_units(shares: Decimal) -> int:
+    """Перевести shares в базовые единицы ERC-1155 (округление вниз)."""
+    if shares <= 0:
+        return 0
+    return int((shares * POSITION_DECIMALS).to_integral_value(rounding=ROUND_DOWN))
 
 
 @dataclass(slots=True)
@@ -30,6 +42,11 @@ class TargetMarket:
     asset: str                         # 'BTC' | 'ETH'
     strike: Decimal | None = None      # цена базового актива на открытии окна
     fees_enabled: bool = False
+    # Ставка комиссии, которую платим МЫ, и её экспонента (см. fee_per_share).
+    # fee_rate == 0 означает «для нас этот рынок бесплатный»: либо комиссий
+    # нет вовсе, либо они taker-only, а мы всегда мейкер (post_only=True).
+    fee_rate: Decimal = ZERO
+    fee_exponent: Decimal = ZERO
     rewards_max_spread: Decimal | None = None
     rewards_min_size: Decimal | None = None
 
@@ -42,6 +59,42 @@ class TargetMarket:
 
     def other(self, outcome: Outcome) -> Outcome:
         return "NO" if outcome == "YES" else "YES"
+
+    # ------------------------------------------------------------ комиссии
+
+    def fee_per_share(self, price: Decimal) -> Decimal:
+        """
+        Комиссия за одну share, купленную по цене `price`, в USDC.
+
+        Форма взята из самого SDK (adjust_buy_amount_for_fees):
+
+            effective_rate = rate * (p * (1 - p)) ** exponent
+            fee_usdc       = shares * effective_rate
+
+        Комиссия максимальна у 0.50 и падает к краям книги — то есть бьёт
+        ровно по тем ценам, вокруг которых мы и котируем.
+        """
+        if self.fee_rate <= 0:
+            return ZERO
+        base = price * (ONE - price)
+        if base <= 0:
+            return ZERO
+        if self.fee_exponent == 0:
+            return self.fee_rate
+        return self.fee_rate * (base ** self.fee_exponent)
+
+    def fee_for(self, price: Decimal, size: Decimal) -> Decimal:
+        """Комиссия за исполнение `size` shares по цене `price`."""
+        return self.fee_per_share(price) * size
+
+    def fee_per_pair(self, yes_price: Decimal, no_price: Decimal) -> Decimal:
+        """
+        Комиссия за сборку одной полной пары — обе ноги вместе.
+
+        Именно её надо вычесть из маржи пары: пара приносит
+        1 - (a + b) валовых, а чистыми — 1 - (a + b) - fee_per_pair.
+        """
+        return self.fee_per_share(yes_price) + self.fee_per_share(no_price)
 
 
 @dataclass(slots=True)
@@ -143,6 +196,8 @@ class MarketPosition:
     no_cost: Decimal = ZERO
     realized_pnl: Decimal = ZERO
     merged_pairs: Decimal = ZERO
+    fees_paid: Decimal = ZERO          # комиссии рынка, уплаченные на филлах
+    merge_costs: Decimal = ZERO        # газ, потраченный на merge пар
 
     @property
     def complete_pairs(self) -> Decimal:
@@ -167,40 +222,155 @@ class MarketPosition:
         avg_no = self.no_cost / self.no_size
         return avg_yes + avg_no
 
-    def apply_fill(self, outcome: Outcome, side: Side, price: Decimal, size: Decimal) -> None:
-        """Обновление позиции по факту исполнения."""
+    def apply_fill(
+        self,
+        outcome: Outcome,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        fee: Decimal = ZERO,
+    ) -> None:
+        """
+        Обновление позиции по факту исполнения.
+
+        Комиссия покупки капитализируется в себестоимость, а не списывается
+        в PnL сразу: тогда pair_cost_basis() автоматически показывает полную
+        цену пары, и прибыль merge считается уже чистой от комиссий.
+        """
         signed = size if side == "BUY" else -size
+        self.fees_paid += fee
         if outcome == "YES":
             if side == "BUY":
-                self.yes_cost += price * size
+                self.yes_cost += price * size + fee
             else:
                 avg = self.yes_cost / self.yes_size if self.yes_size > 0 else ZERO
                 self.yes_cost -= avg * size
-                self.realized_pnl += (price - avg) * size
+                self.realized_pnl += (price - avg) * size - fee
             self.yes_size += signed
         else:
             if side == "BUY":
-                self.no_cost += price * size
+                self.no_cost += price * size + fee
             else:
                 avg = self.no_cost / self.no_size if self.no_size > 0 else ZERO
                 self.no_cost -= avg * size
-                self.realized_pnl += (price - avg) * size
+                self.realized_pnl += (price - avg) * size - fee
             self.no_size += signed
 
-    def apply_merge(self, size: Decimal) -> None:
-        """Merge полной пары: YES+NO -> $1 USDC. Фиксирует прибыль пары."""
+    def apply_merge(self, size: Decimal, gas_cost: Decimal = ZERO) -> None:
+        """
+        Merge полной пары: YES+NO -> $1 USDC. Фиксирует прибыль пары.
+
+        `gas_cost` — издержки транзакции целиком за merge (не за пару).
+        Merge на Polygon не бесплатен, и на мелких пачках газ съедает всю
+        маржу; учитываем его здесь, чтобы PnL не был приукрашен.
+        """
         size = min(size, self.complete_pairs)
         if size <= 0:
             return
         avg_yes = self.yes_cost / self.yes_size if self.yes_size > 0 else ZERO
         avg_no = self.no_cost / self.no_size if self.no_size > 0 else ZERO
         cost = (avg_yes + avg_no) * size
-        self.realized_pnl += size * ONE - cost
+        self.realized_pnl += size * ONE - cost - gas_cost
+        self.merge_costs += gas_cost
         self.yes_cost -= avg_yes * size
         self.no_cost -= avg_no * size
         self.yes_size -= size
         self.no_size -= size
         self.merged_pairs += size
+
+    def apply_recovered(
+        self, outcome: Outcome, size: Decimal, avg_price: Decimal | None
+    ) -> None:
+        """
+        Внести в учёт позицию, найденную на бирже при старте бота.
+
+        realized_pnl намеренно не трогаем: PnL прошлой сессии — не наш
+        результат, а дневной лимит убытка должен считаться от старта.
+        Если биржа не отдала среднюю цену, берём 1.0 USDC за share — это
+        верхняя граница себестоимости. Она завышает нотионал, поэтому
+        риск-лимиты сработают раньше, а не позже.
+        """
+        if size <= 0:
+            return
+        avg = avg_price if avg_price and avg_price > 0 else ONE
+        if outcome == "YES":
+            self.yes_size += size
+            self.yes_cost += avg * size
+        else:
+            self.no_size += size
+            self.no_cost += avg * size
+
+
+# Как биржа называет стороны бинарного рынка. Up/Down-серии подписывают
+# исходы словами 'Up' и 'Down', а не 'Yes' и 'No'.
+_YES_LABELS = frozenset({"YES", "UP"})
+_NO_LABELS = frozenset({"NO", "DOWN"})
+
+
+def outcome_label(position) -> Outcome | None:  # noqa: ANN001 - модель SDK
+    """Сторона позиции по ответу API, если её вообще можно определить."""
+    raw = getattr(position, "outcome", None)
+    if raw is not None:
+        text = str(raw).strip().upper()
+        if text in _YES_LABELS:
+            return "YES"
+        if text in _NO_LABELS:
+            return "NO"
+    index = getattr(position, "outcome_index", None)
+    if index is not None:
+        try:
+            return "YES" if int(index) == 0 else "NO"
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+@dataclass(slots=True)
+class RecoveredPosition:
+    """
+    Позиция, найденная на бирже при старте бота.
+
+    Бот не единственный источник правды: после рестарта (или падения) на
+    кошельке остаются shares прошлой сессии. Пока они не заведены в учёт,
+    все риск-лимиты считаются от нуля — то есть от неверной базы.
+    """
+
+    condition_id: str
+    token_id: str
+    size: Decimal
+    avg_price: Decimal | None = None
+    # Сторона, если её удалось определить по ответу API. None => неизвестна,
+    # определим позже по token_id, когда discovery найдёт этот рынок.
+    outcome: Outcome | None = None
+    title: str = ""
+    # Рынок резолвлен, позиция ждёт redeem: это уже требование к USDC,
+    # а не рыночный риск.
+    redeemable: bool = False
+
+    @classmethod
+    def from_api(cls, position) -> RecoveredPosition | None:  # noqa: ANN001
+        """
+        Разобрать позицию из ответа SDK. None — брать в учёт нечего.
+
+        Читаем через getattr: формат ответа биржи меняется без нашего
+        участия, и падать на незнакомом поле в момент старта — худшее,
+        что может сделать риск-контур.
+        """
+        condition_id = str(getattr(position, "condition_id", "") or "")
+        raw_size = getattr(position, "size", None)
+        size = Decimal(str(raw_size)) if raw_size is not None else ZERO
+        if not condition_id or size <= 0:
+            return None
+        raw_avg = getattr(position, "avg_price", None)
+        return cls(
+            condition_id=condition_id,
+            token_id=str(getattr(position, "token_id", "") or ""),
+            size=size,
+            avg_price=Decimal(str(raw_avg)) if raw_avg is not None else None,
+            outcome=outcome_label(position),
+            title=str(getattr(position, "title", "") or ""),
+            redeemable=bool(getattr(position, "redeemable", False)),
+        )
 
 
 @dataclass(slots=True)

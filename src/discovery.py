@@ -30,7 +30,7 @@ from statistics import NormalDist
 
 from polymarket import AsyncSecureClient
 
-from .models import TargetMarket
+from .models import ONE, ZERO, TargetMarket
 
 log = logging.getLogger("polybot.discovery")
 
@@ -134,6 +134,7 @@ class MarketDiscovery:
         min_seconds: int,
         max_seconds: int,
         max_markets: int,
+        fallback_fee_rate: Decimal = ZERO,
     ) -> None:
         self.client = client
         self.series_slugs = series_slugs
@@ -141,6 +142,7 @@ class MarketDiscovery:
         self.min_seconds = min_seconds
         self.max_seconds = max_seconds
         self.max_markets = max_markets
+        self.fallback_fee_rate = fallback_fee_rate
         # Спот, записанный на момент открытия окна: condition_id -> price.
         self._observed_open: dict[str, Decimal] = {}
         self._strike_cache: dict[str, Decimal] = {}
@@ -236,6 +238,7 @@ class MarketDiscovery:
         tick = Decimal(str(getattr(trading, "minimum_tick_size", None) or "0.01"))
         min_size = Decimal(str(getattr(trading, "minimum_order_size", None) or "5"))
         rewards = getattr(m, "rewards", None)
+        fee_rate, fee_exponent = self._resolve_fees(trading, str(getattr(m, "slug", "")))
 
         target = TargetMarket(
             condition_id=str(m.condition_id),
@@ -249,6 +252,8 @@ class MarketDiscovery:
             neg_risk=bool(getattr(state, "neg_risk", False)),
             asset=asset,
             fees_enabled=bool(getattr(trading, "fees_enabled", False)),
+            fee_rate=fee_rate,
+            fee_exponent=fee_exponent,
             rewards_max_spread=(
                 Decimal(str(rewards.rewards_max_spread))
                 if rewards and getattr(rewards, "rewards_max_spread", None)
@@ -262,6 +267,40 @@ class MarketDiscovery:
         )
         target.strike = self._resolve_strike(target, m, spot_prices)
         return target
+
+    def _resolve_fees(self, trading, slug: str) -> tuple[Decimal, Decimal]:  # noqa: ANN001
+        """
+        Ставка комиссии, которую заплатим МЫ, и её экспонента.
+
+        Все наши ордера post_only=True, то есть мы всегда мейкер. Поэтому
+        расписание, помеченное taker_only, нас не касается — для нас такой
+        рынок бесплатный. Если же комиссии включены, а расписание не пришло,
+        берём консервативную ставку из конфига: недооценка комиссии означает
+        котирование с отрицательной чистой маржой, и заметить это по логам
+        почти невозможно.
+        """
+        if not bool(getattr(trading, "fees_enabled", False)):
+            return ZERO, ZERO
+
+        schedule = getattr(trading, "fee_schedule", None)
+        if schedule is None:
+            log.warning(
+                "[%s] fees_enabled=true, но расписание комиссий не отдано — "
+                "считаю по консервативной ставке %s",
+                slug, self.fallback_fee_rate,
+            )
+            return self.fallback_fee_rate, ONE
+
+        if bool(getattr(schedule, "taker_only", False)):
+            log.info("[%s] Комиссия taker-only, а мы всегда мейкер => 0", slug)
+            return ZERO, ZERO
+
+        raw_rate = getattr(schedule, "rate", None)
+        raw_exponent = getattr(schedule, "exponent", None)
+        rate = Decimal(str(raw_rate)) if raw_rate is not None else self.fallback_fee_rate
+        exponent = Decimal(str(raw_exponent)) if raw_exponent is not None else ONE
+        log.info("[%s] Комиссия рынка: rate=%s exponent=%s", slug, rate, exponent)
+        return max(rate, ZERO), max(exponent, ZERO)
 
     def _resolve_strike(
         self, target: TargetMarket, m, spot_prices: dict[str, float]

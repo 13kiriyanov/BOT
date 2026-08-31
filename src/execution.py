@@ -29,8 +29,15 @@ from .models import ZERO, LiveOrder, Quote
 
 log = logging.getLogger("polybot.exec")
 
-FillCallback = Callable[[str, str, str, Decimal, Decimal], Awaitable[None]]
-"""(condition_id, token_id, side, price, size)"""
+FillCallback = Callable[
+    [str, str, str, Decimal, Decimal, Decimal | None], Awaitable[None]
+]
+"""(condition_id, token_id, side, price, size, fee_rate_bps)
+
+fee_rate_bps — ставка, которую биржа реально применила к филлу, или None,
+если она её не прислала. Нужна, чтобы поймать расхождение нашей модели
+комиссий с действительностью.
+"""
 
 
 class RateLimiter:
@@ -311,14 +318,18 @@ class OrderManager:
             if size <= 0 or not token:
                 return
 
+            raw_fee_bps = getattr(payload, "fee_rate_bps", None)
+            fee_rate_bps = Decimal(str(raw_fee_bps)) if raw_fee_bps is not None else None
+
             condition_id = self._token_market.get(token, "")
             log.info("ФИЛЛ: %s %s @ %s (%s)", side, size, price, token[:10])
             log_event(
                 "fill", token=token, side=side, price=price,
                 size=size, condition_id=condition_id, status=status,
+                fee_rate_bps=fee_rate_bps,
             )
             if self.on_fill and condition_id:
-                await self.on_fill(condition_id, token, side, price, size)
+                await self.on_fill(condition_id, token, side, price, size, fee_rate_bps)
 
     async def run_user_stream(self) -> None:
         """Слушает свои ордера и трейды. Без этого бот слеп к своим филлам."""

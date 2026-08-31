@@ -179,7 +179,27 @@ class QuoteGenerator:
     ) -> list[Quote]:
         """Сформировать желаемые котировки (BUY YES и BUY NO)."""
         tick = market.tick_size
-        half = (ONE - self.s.target_pair_cost) / 2
+
+        r = self.reservation_price(fv.fair, position, fv)
+        r = clamp_price(r, tick)
+
+        # КОМИССИЯ. Пара приносит 1 - (a + b) валовых, но комиссия рынка
+        # списывается с каждой ноги, поэтому чистая маржа меньше. Оцениваем
+        # её по резервной цене, чтобы сразу раздвинуть спред; точная проверка
+        # по финальным ценам — ниже, перед выдачей котировок.
+        fee_pair = market.fee_per_pair(r, ONE - r)
+
+        # Планка: полная стоимость пары (биды + комиссия) не должна
+        # превысить max_pair_cost. Значит на сами биды остаётся меньше.
+        budget = self.s.max_pair_cost - fee_pair
+        if budget <= 0:
+            log.debug(
+                "[%s] Комиссия %s съедает всю планку %s — не котирую",
+                market.slug, fee_pair, self.s.max_pair_cost,
+            )
+            return []
+
+        half = (ONE - (self.s.target_pair_cost - fee_pair)) / 2
 
         # Полуспред не может быть меньше минимума в тиках.
         min_half = tick * self.s.min_half_spread_ticks
@@ -193,15 +213,10 @@ class QuoteGenerator:
             if reward_half > 0:
                 half = min(half, reward_half)
 
-        r = self.reservation_price(fv.fair, position, fv)
-        r = clamp_price(r, tick)
-
         raw_yes_bid = r - half
         raw_no_bid = (ONE - r) - half
 
-        # Планка: сумма двух бидов не должна превысить max_pair_cost.
         # Распределяем допустимый бюджет пропорционально.
-        budget = self.s.max_pair_cost
         max_yes = budget - raw_no_bid
         max_no = budget - raw_yes_bid
 
@@ -212,18 +227,23 @@ class QuoteGenerator:
         if yes_price is None or no_price is None:
             return quotes
 
-        # ФИНАЛЬНАЯ ЗАЩИТА: если после всех округлений и подгонок под книгу
-        # сумма пары стала невыгодной — не котируем вообще.
-        pair_cost = yes_price + no_price
-        if pair_cost >= budget:
+        # ФИНАЛЬНАЯ ЗАЩИТА: если после всех округлений, подгонок под книгу и
+        # комиссий полная стоимость пары стала невыгодной — не котируем вообще.
+        # Здесь комиссия считается уже по фактическим ценам, а не по оценке.
+        cap = self.s.max_pair_cost
+        pair_cost = yes_price + no_price + market.fee_per_pair(yes_price, no_price)
+        if pair_cost >= cap:
             log.debug(
-                "[%s] Пара невыгодна: %s + %s = %s >= %s",
-                market.slug, yes_price, no_price, pair_cost, budget,
+                "[%s] Пара невыгодна: %s + %s + комиссия = %s >= %s",
+                market.slug, yes_price, no_price, pair_cost, cap,
             )
             # Пробуем ужать обе стороны на тик.
             yes_price -= tick
             no_price -= tick
-            if yes_price + no_price >= budget or yes_price <= 0 or no_price <= 0:
+            if yes_price <= 0 or no_price <= 0:
+                return quotes
+            pair_cost = yes_price + no_price + market.fee_per_pair(yes_price, no_price)
+            if pair_cost >= cap:
                 return quotes
 
         yes_size = self._size_for(market, position, "YES", fv)
