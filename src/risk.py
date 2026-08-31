@@ -26,6 +26,7 @@ class HaltReason(str, Enum):
     NOTIONAL = "max_notional"
     HEARTBEAT = "heartbeat_timeout"
     REJECTS = "consecutive_rejects"
+    DESYNC = "position_desync"
     MANUAL = "manual_stop"
     FATAL = "fatal_error"
 

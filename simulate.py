@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing
 import random
 import statistics
 from decimal import Decimal
@@ -65,6 +66,43 @@ class SimStrat:
 class SimRisk:
     max_position_per_side = D("250")
     max_net_exposure = D("120")
+
+
+Z95 = 1.96
+
+
+def mean_ci(values: list[float], z: float = Z95) -> tuple[float, float]:
+    """Среднее и полуширина его доверительного интервала (CLT)."""
+    n = len(values)
+    mean = statistics.mean(values)
+    if n < 2:
+        return mean, float("inf")
+    half = z * statistics.stdev(values) / math.sqrt(n)
+    return mean, half
+
+
+def share_ci(hits: int, n: int, z: float = Z95) -> tuple[float, float]:
+    """Доля и полуширина её интервала (нормальное приближение биномиального)."""
+    if n == 0:
+        return 0.0, float("inf")
+    p = hits / n
+    return p, z * math.sqrt(p * (1.0 - p) / n)
+
+
+def paired_diff_ci(
+    baseline: list[float], other: list[float], z: float = Z95
+) -> tuple[float, float]:
+    """
+    Разность средних по ПАРНЫМ прогонам (общие seed'ы) и её интервал.
+
+    Дисперсия разности на общих сценариях намного ниже дисперсии самих
+    уровней — поэтому соседние уровни toxicity сравниваются именно так,
+    а не по перекрытию их индивидуальных интервалов.
+    """
+    if len(baseline) != len(other):
+        raise ValueError("парное сравнение требует одинакового числа прогонов")
+    diffs = [b - a for a, b in zip(baseline, other)]
+    return mean_ci(diffs, z)
 
 
 def true_probability(spot: float, strike: float, secs: float, sigma: float) -> float:
@@ -96,7 +134,19 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             toxicity: float = 0.35, queue_factor: float = 0.45,
             fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01")) -> dict:
     """Одно торговое окно."""
-    rng = random.Random(seed)
+    # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
+    # seed и разной toxicity получают одинаковые базовую траекторию спота,
+    # рыночный шум и лотерею очереди — различия между уровнями создаёт
+    # только сама toxicity. Это common random numbers: парная разность
+    # уровней получается точнее, чем разность независимых прогонов.
+    # Оговорка: шоки adverse selection двигают спот — это сам механизм
+    # воздействия, — поэтому после первого филла траектории расходятся.
+    # Выравнивание частичное (корреляция уровней ~0.3-0.6), и выигрыш
+    # тем меньше, чем дальше уровни друг от друга.
+    rng_path = random.Random(seed * 4 + 0)     # GBM-приращения спота
+    rng_market = random.Random(seed * 4 + 1)   # шум цены рынка
+    rng_queue = random.Random(seed * 4 + 2)    # лотерея очереди исполнения
+    rng_tox = random.Random(seed * 4 + 3)      # триггер и величина шока
     quoter = QuoteGenerator(SimStrat(), SimRisk())
     fvm = FairValueModel(D("0.35"), D("0.30"), D("0.15"))
     vol = VolatilityEstimator(45.0, 8.0, 0.30)
@@ -122,12 +172,12 @@ def run_one(window_s: int, sigma: float, market_noise: float,
 
         # Эволюция спота (GBM).
         dt_y = tick_dt / SECONDS_PER_YEAR
-        spot *= math.exp(-0.5 * sigma**2 * dt_y + sigma * math.sqrt(dt_y) * rng.gauss(0, 1))
+        spot *= math.exp(-0.5 * sigma**2 * dt_y + sigma * math.sqrt(dt_y) * rng_path.gauss(0, 1))
         vol.update(spot, step * tick_dt)
 
         # Рынок = истинная вероятность + шум.
         p_true = true_probability(spot, strike, left, sigma)
-        p_mkt = min(0.97, max(0.03, p_true + rng.gauss(0, market_noise)))
+        p_mkt = min(0.97, max(0.03, p_true + rng_market.gauss(0, market_noise)))
 
         yes_book = make_book(p_mkt, market_spread)
         no_book = make_book(1 - p_mkt, market_spread)
@@ -166,7 +216,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
                 continue
             # Очередь: базовая вероятность низкая, растёт с глубиной прохода.
             prob = min(0.12, through * 2.5) * queue_factor
-            if rng.random() >= prob:
+            if rng_queue.random() >= prob:
                 continue
 
             pos.apply_fill(
@@ -176,8 +226,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
 
             # Adverse selection: с вероятностью `toxicity` этот филл был от
             # информированного участника, и цена немедленно уходит против нас.
-            if rng.random() < toxicity:
-                shock = abs(rng.gauss(0, 1)) * sigma * math.sqrt(1.0 / SECONDS_PER_YEAR)
+            if rng_tox.random() < toxicity:
+                shock = abs(rng_tox.gauss(0, 1)) * sigma * math.sqrt(1.0 / SECONDS_PER_YEAR)
                 # Купили YES -> спот идёт вниз, и наоборот.
                 spot *= math.exp(-shock * 8 if q.outcome == "YES" else shock * 8)
 
@@ -201,6 +251,76 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     }
 
 
+def run_level(args, toxicity: float) -> list[dict]:
+    """Прогнать один уровень toxicity на seed'ах 0..runs-1."""
+    tasks = [
+        (args.window, args.sigma, args.noise, args.spread, seed,
+         toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas))
+        for seed in range(args.runs)
+    ]
+    if args.jobs > 1:
+        with multiprocessing.Pool(args.jobs) as pool:
+            return pool.starmap(run_one, tasks, chunksize=25)
+    return [run_one(*t) for t in tasks]
+
+
+def print_level_report(results: list[dict]) -> None:
+    pnls = [r["pnl"] for r in results]
+    fills = [r["fills"] for r in results]
+    merged = [r["merged"] for r in results]
+    fees = [r["fees"] for r in results]
+    gas = [r["gas"] for r in results]
+
+    mean, half = mean_ci(pnls)
+    stdev = statistics.pstdev(pnls) or 1e-9
+    win_share, win_half = share_ci(sum(1 for p in pnls if p > 0), len(pnls))
+
+    print(f"Средний PnL за окно : {mean:+.3f} ± {half:.3f} USDC (95% CI)")
+    print(f"Медиана             : {statistics.median(pnls):+.3f}")
+    print(f"Ст. отклонение      : {stdev:.3f}")
+    print(f"Sharpe (за окно)    : {mean / stdev:.3f}")
+    print(f"Доля прибыльных окон: {win_share:.1%} ± {win_half:.1%}")
+    print(f"Худшее окно         : {min(pnls):+.3f}")
+    print(f"Лучшее окно         : {max(pnls):+.3f}")
+    print(f"Филлов за окно      : {statistics.mean(fills):.1f}")
+    print(f"Смержено пар        : {statistics.mean(merged):.1f}")
+    print(f"Комиссии за окно    : {statistics.mean(fees):.3f} USDC")
+    print(f"Газ merge за окно   : {statistics.mean(gas):.3f} USDC")
+
+
+def run_sweep(args, levels: list[float]) -> None:
+    """
+    Прогнать несколько уровней toxicity на ОБЩИХ seed'ах и сравнить их
+    парно. Именно параметр --sweep порождает таблицу для README.
+    """
+    print(f"Sweep по toxicity {levels}: {args.runs} прогонов на уровень, "
+          f"общие seed'ы, jobs={args.jobs}")
+    print("-" * 62)
+
+    per_level: dict[float, list[float]] = {}
+    for level in levels:
+        results = run_level(args, level)
+        per_level[level] = [r["pnl"] for r in results]
+        mean, half = mean_ci(per_level[level])
+        wins, win_half = share_ci(
+            sum(1 for p in per_level[level] if p > 0), len(per_level[level])
+        )
+        print(f"toxicity {level:4.2f} | PnL {mean:+7.2f} ± {half:.2f} | "
+              f"прибыльных {wins:.1%} ± {win_half:.1%}")
+
+    print("-" * 62)
+    print("Парные разности соседних уровней (общие seed'ы):")
+    for lo, hi in zip(levels, levels[1:]):
+        diff, half = paired_diff_ci(per_level[lo], per_level[hi])
+        verdict = (
+            "СТАТИСТИЧЕСКИ НЕРАЗЛИЧИМО" if abs(diff) <= half else "различимо"
+        )
+        print(f"  {lo:.2f} -> {hi:.2f}: ΔPnL {diff:+.2f} ± {half:.2f}  ({verdict})")
+    print("-" * 62)
+    print("Неразличимая разность означает: на этом числе прогонов эффект")
+    print("уровня не отделяется от шума. Это свойство данных, а не ошибка.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=200)
@@ -216,44 +336,32 @@ def main() -> None:
                     help="ставка комиссии рынка (0 = рынок без комиссий)")
     ap.add_argument("--merge-gas", type=str, default="0.01",
                     help="стоимость одной транзакции merge, USDC")
+    ap.add_argument("--sweep", type=str, default=None,
+                    help="уровни toxicity через запятую (например 0.2,0.35,0.5,0.65): "
+                         "прогнать все на общих seed'ах и сравнить парно")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="процессов для параллельного прогона")
     args = ap.parse_args()
 
     print(__doc__)
+
+    if args.sweep:
+        levels = [float(x) for x in args.sweep.split(",") if x.strip()]
+        if len(levels) < 2:
+            raise SystemExit("--sweep требует минимум два уровня")
+        run_sweep(args, levels)
+        return
+
     print(f"Прогонов: {args.runs} | окно {args.window}s | sigma {args.sigma} | "
           f"toxicity {args.toxicity} | queue {args.queue} | "
           f"комиссия {args.fee_rate} | газ merge {args.merge_gas}")
     print("-" * 62)
-
-    results = [
-        run_one(args.window, args.sigma, args.noise, args.spread, seed,
-                args.toxicity, args.queue, D(args.fee_rate), D(args.merge_gas))
-        for seed in range(args.runs)
-    ]
-    pnls = [r["pnl"] for r in results]
-    fills = [r["fills"] for r in results]
-    merged = [r["merged"] for r in results]
-    fees = [r["fees"] for r in results]
-    gas = [r["gas"] for r in results]
-
-    mean = statistics.mean(pnls)
-    stdev = statistics.pstdev(pnls) or 1e-9
-    wins = sum(1 for p in pnls if p > 0)
-
-    print(f"Средний PnL за окно : {mean:+.3f} USDC")
-    print(f"Медиана             : {statistics.median(pnls):+.3f}")
-    print(f"Ст. отклонение      : {stdev:.3f}")
-    print(f"Sharpe (за окно)    : {mean / stdev:.3f}")
-    print(f"Доля прибыльных окон: {wins / len(pnls):.1%}")
-    print(f"Худшее окно         : {min(pnls):+.3f}")
-    print(f"Лучшее окно         : {max(pnls):+.3f}")
-    print(f"Филлов за окно      : {statistics.mean(fills):.1f}")
-    print(f"Смержено пар        : {statistics.mean(merged):.1f}")
-    print(f"Комиссии за окно    : {statistics.mean(fees):.3f} USDC")
-    print(f"Газ merge за окно   : {statistics.mean(gas):.3f} USDC")
+    print_level_report(run_level(args, args.toxicity))
     print("-" * 62)
-    print("НАПОМИНАНИЕ: это верхняя граница. Прогоните --toxicity 0.5 и 0.65,")
-    print("чтобы увидеть, как быстро стратегия уходит в минус. Реальная")
-    print("toxicity против розничного бота обычно ВЫШЕ, чем вы думаете.")
+    print("НАПОМИНАНИЕ: это верхняя граница. Прогоните --sweep 0.2,0.35,0.5,0.65,")
+    print("чтобы увидеть чувствительность к adverse selection с парным")
+    print("сравнением уровней. Реальная toxicity против розничного бота")
+    print("обычно ВЫШЕ, чем вы думаете.")
 
 
 if __name__ == "__main__":

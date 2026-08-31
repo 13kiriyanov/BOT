@@ -8,6 +8,7 @@
   discovery_loop  — периодический поиск активных рынков
   quote_loop      — ГЛАВНЫЙ цикл: пересчёт и перевыставление котировок
   merge_loop      — merge полных пар обратно в USDC
+  position_sync   — сверка локального учёта позиций с биржей
   watchdog        — dead-man switch
 
 Watchdog намеренно живёт в отдельной задаче и следит за heartbeat главного
@@ -29,11 +30,13 @@ from .discovery import MarketDiscovery
 from .execution import OrderManager
 from .fair_value import FairValueModel
 from .logging_setup import log_event
+from .markout import MarkoutTracker
 from .models import (
     ONE,
     POSITION_DECIMALS,
     ZERO,
     Book,
+    Fill,
     MarketPosition,
     Outcome,
     Quote,
@@ -52,6 +55,13 @@ log = logging.getLogger("polybot.engine")
 # Читаем настойчиво: неудача здесь означает остановку торговли.
 RECOVERY_ATTEMPTS = 3
 RECOVERY_RETRY_DELAY_S = 2.0
+
+# Период сверки локального учёта позиций с биржей.
+POSITION_SYNC_INTERVAL_S = 60.0
+# Рынки со свежим филлом или merge сверка пропускает: data-api, из которого
+# читается list_positions(), отстаёт от CLOB на секунды, и сразу после
+# исполнения «расхождение» — это лаг индексатора, а не ошибка учёта.
+SYNC_ACTIVITY_GUARD_S = 90.0
 
 
 class TradingEngine:
@@ -72,6 +82,8 @@ class TradingEngine:
         )
         self.quoter = QuoteGenerator(settings.strategy, settings.risk)
         self.risk = RiskManager(settings.risk)
+        # Замер adverse selection по каждому филлу (см. markout.py).
+        self.markout = MarkoutTracker(self._markout_mid)
 
         self.discovery: MarketDiscovery | None = None
         self.orders: OrderManager | None = None
@@ -85,6 +97,9 @@ class TradingEngine:
         # (rate, exponent). discovery пересоздаёт объекты рынков каждый цикл,
         # и без этого словаря знание терялось бы через 20 секунд.
         self._fee_overrides: dict[str, tuple[Decimal, Decimal]] = {}
+        # Момент последнего филла или merge по рынку: сверка позиций не
+        # трогает рынки со свежей активностью (data-api отстаёт от CLOB).
+        self._last_activity: dict[str, float] = {}
         self._last_merge = 0.0
         self._shutdown = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -144,7 +159,11 @@ class TradingEngine:
     async def _check_balance(self) -> None:
         try:
             bal = await self.client.get_balance_allowance(asset_type="COLLATERAL")  # type: ignore[union-attr]
-            log.info("Баланс USDC: %s", getattr(bal, "balance", "?"))
+            raw = getattr(bal, "balance", None)
+            # BalanceAllowance.balance приходит в базовых единицах (6 знаков),
+            # а не в USDC: без деления лог врёт в миллион раз.
+            human = Decimal(raw) / POSITION_DECIMALS if raw is not None else "?"
+            log.info("Баланс USDC: %s", human)
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось прочитать баланс: %s", exc)
 
@@ -297,32 +316,46 @@ class TradingEngine:
             self.positions[condition_id] = MarketPosition(condition_id=condition_id)
         return self.positions[condition_id]
 
-    async def _on_fill(
-        self,
-        condition_id: str,
-        token_id: str,
-        side: str,
-        price: Decimal,
-        size: Decimal,
-        fee_rate_bps: Decimal | None = None,
-    ) -> None:
+    def _markout_mid(self, token_id: str, complement_id: str) -> Decimal | None:
+        """
+        Mid токена для замера mark-out: прямая книга, иначе зеркало из
+        дополнения. Протухшая книга — это не цена: рынок мог истечь, и
+        замороженный mid дал бы фиктивный mark-out.
+        """
+        stale_after = self.cfg.risk.stale_book_timeout_s
+        book = self.books.book(token_id)
+        if book is not None and not book.is_stale(stale_after):
+            mid = book.mid
+            if mid is not None:
+                return mid
+        implied = self.books.implied_from_complement(token_id, complement_id)
+        if implied is not None and not implied.is_stale(stale_after):
+            return implied.mid
+        return None
+
+    async def _on_fill(self, fill: Fill) -> None:
         """Колбэк из user stream: обновить позицию и риск."""
-        market = self.markets.get(condition_id)
+        market = self.markets.get(fill.condition_id)
         if market is None:
-            log.warning("Филл по неизвестному рынку %s", condition_id[:12])
+            log.warning("Филл по неизвестному рынку %s", fill.condition_id[:12])
             return
 
-        self._audit_reported_fee(market, fee_rate_bps)
+        self._audit_reported_fee(market, fill.fee_rate_bps)
 
-        outcome = "YES" if token_id == market.yes_token_id else "NO"
-        fee = market.fee_for(price, size)
-        pos = self._position(condition_id)
+        outcome: Outcome = "YES" if fill.token_id == market.yes_token_id else "NO"
+        fee = market.fee_for(fill.price, fill.size)
+        pos = self._position(fill.condition_id)
         before = pos.realized_pnl
-        pos.apply_fill(outcome, side, price, size, fee)  # type: ignore[arg-type]
+        pos.apply_fill(outcome, fill.side, fill.price, fill.size, fee)
+        self._last_activity[fill.condition_id] = time.time()
 
-        self.risk.record_fill(price, size)
+        self.risk.record_fill(fill.price, fill.size)
         if pos.realized_pnl != before:
             self.risk.record_realized(pos.realized_pnl - before)
+
+        self.markout.record_fill(
+            fill, outcome, market.token_for(market.other(outcome))
+        )
 
         pairs = pos.complete_pairs
         basis = pos.pair_cost_basis()
@@ -435,6 +468,7 @@ class TradingEngine:
         if stale:
             await self.orders.cancel(stale)  # type: ignore[union-attr]
         self.discovery.forget(market.condition_id)  # type: ignore[union-attr]
+        self.markout.forget_market(market.condition_id)
 
     def _book_for(self, market: TargetMarket, outcome: str) -> Book | None:
         """Стакан токена, при необходимости восстановленный из дополнения."""
@@ -633,6 +667,7 @@ class TradingEngine:
                     )
                     before = pos.realized_pnl
                     pos.apply_merge(merged, gas)
+                    self._last_activity[cid] = time.time()
                     profit = pos.realized_pnl - before
                     self.risk.record_realized(profit)
                     log_event(
@@ -675,9 +710,11 @@ class TradingEngine:
                 fees, gas,
                 "HALTED:" + snap["reason"] if snap["halted"] else "OK",
             )
+            for line in self.markout.summary_lines():
+                log.info(line)
             log_event(
                 "status", **snap, pairs=pairs, merged=merged, net=net,
-                fees=fees, merge_gas=gas,
+                fees=fees, merge_gas=gas, markout=self.markout.summary(),
             )
 
     async def sync_loop(self) -> None:
@@ -686,6 +723,120 @@ class TradingEngine:
             await asyncio.sleep(45.0)
             if self.orders and not self.risk.is_halted:
                 await self.orders.sync_open_orders()
+
+    # ------------------------------------------------- сверка позиций
+
+    async def position_sync_loop(self) -> None:
+        """
+        Периодическая сверка локального учёта позиций с биржей.
+
+        Локальный учёт строится из событий user-stream, а события теряются:
+        разрыв WebSocket, пропущенный статус, FAILED после учтённого
+        MATCHED, merge, не прошедший on-chain. Каждая потеря — тихое
+        расхождение с реальностью, на котором все лимиты риска считаются
+        от вымышленной позиции. Сверка — единственный механизм, который
+        возвращает учёт к фактам.
+        """
+        while not self._shutdown.is_set():
+            await asyncio.sleep(POSITION_SYNC_INTERVAL_S)
+            if self.cfg.runtime.dry_run or self.risk.is_halted:
+                # В dry run филлы локальные, на бирже их нет — сверять нечего.
+                continue
+            try:
+                await self._sync_positions_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.error("position_sync_loop: %s", exc)
+
+    def _exchange_outcome(self, rec: RecoveredPosition) -> Outcome | None:
+        """Сторона биржевой позиции: token_id рынка надёжнее ярлыка API."""
+        market = self.markets.get(rec.condition_id)
+        if market is not None and rec.token_id:
+            if rec.token_id == market.yes_token_id:
+                return "YES"
+            if rec.token_id == market.no_token_id:
+                return "NO"
+        return rec.outcome
+
+    async def _sync_positions_once(self) -> None:
+        """Одна сверка: расхождение больше допуска — предупреждение и
+        коррекция к данным биржи; больше order_size*3 — остановка."""
+        exchange: dict[str, dict[Outcome, RecoveredPosition]] = {}
+        async for p in self.client.list_positions():  # type: ignore[union-attr]
+            rec = RecoveredPosition.from_api(p)
+            if rec is None or rec.redeemable:
+                continue
+            outcome = self._exchange_outcome(rec)
+            if outcome is None:
+                log.warning(
+                    "Сверка: у позиции %s не определить сторону — пропускаю",
+                    rec.title or rec.condition_id[:12],
+                )
+                continue
+            exchange.setdefault(rec.condition_id, {})[outcome] = rec
+
+        now = time.time()
+        halt_threshold = self.cfg.strategy.order_size * 3
+
+        for cid in sorted(set(self.positions) | set(exchange)):
+            if now - self._last_activity.get(cid, 0.0) < SYNC_ACTIVITY_GUARD_S:
+                log.debug("Сверка %s: свежая активность, пропускаю", cid[:12])
+                continue
+
+            market = self.markets.get(cid)
+            tolerance = (
+                market.min_order_size
+                if market is not None
+                else self.cfg.strategy.fallback_min_order_size
+            )
+            pos = self.positions.get(cid)
+
+            for outcome in ("YES", "NO"):
+                local = ZERO
+                if pos is not None:
+                    local = pos.yes_size if outcome == "YES" else pos.no_size
+                rec = exchange.get(cid, {}).get(outcome)  # type: ignore[arg-type]
+                exch = rec.size if rec is not None else ZERO
+                diff = abs(local - exch)
+                if diff <= tolerance:
+                    continue
+
+                if diff > halt_threshold:
+                    log.critical(
+                        "РАСХОЖДЕНИЕ УЧЁТА: %s %s локально=%s на бирже=%s "
+                        "(разница %s > %s). Учёт недостоверен — останавливаюсь.",
+                        cid[:12], outcome, local, exch, diff, halt_threshold,
+                    )
+                    log_event(
+                        "position_desync", condition_id=cid, outcome=outcome,
+                        local=local, exchange=exch, diff=diff, action="halt",
+                    )
+                    self.risk.halt(
+                        HaltReason.DESYNC,
+                        f"{cid[:12]} {outcome}: локально {local}, на бирже {exch}",
+                    )
+                    return
+
+                log.warning(
+                    "Расхождение учёта: %s %s локально=%s на бирже=%s — "
+                    "корректирую к бирже",
+                    cid[:12], outcome, local, exch,
+                )
+                log_event(
+                    "position_desync", condition_id=cid, outcome=outcome,
+                    local=local, exchange=exch, diff=diff, action="correct",
+                )
+                self._position(cid).correct_side(
+                    outcome,  # type: ignore[arg-type]
+                    exch,
+                    rec.avg_price if rec is not None else None,
+                )
+                # Коррекция уже учла биржевое состояние — отложенное
+                # восстановление по этим токенам стало бы двойным учётом.
+                for token, pending in list(self._recovered_by_token.items()):
+                    if pending.condition_id == cid:
+                        self._recovered_by_token.pop(token, None)
 
     # ------------------------------------------------------------- run
 
@@ -709,6 +860,7 @@ class TradingEngine:
             asyncio.create_task(self.watchdog(), name="watchdog"),
             asyncio.create_task(self.status_loop(), name="status"),
             asyncio.create_task(self.sync_loop(), name="sync"),
+            asyncio.create_task(self.position_sync_loop(), name="possync"),
         ]
 
         log.info("Ждём наполнения фидов (5с) перед первым котированием...")
@@ -737,6 +889,10 @@ class TradingEngine:
 
         self.spot.stop()
         self.books.stop()
+        try:
+            await asyncio.wait_for(self.markout.aclose(), timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Не удалось остановить замеры mark-out: %s", exc)
 
         for t in self._tasks:
             t.cancel()

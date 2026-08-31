@@ -19,6 +19,13 @@ ONE = Decimal("1")
 POSITION_DECIMALS = Decimal("1000000")
 
 
+# Минимальный TTL GTD-ордера. SDK отклоняет expiration ближе, чем
+# now + 180 секунд (_MIN_EXPIRATION_BUFFER_S в polymarket/_internal/actions/
+# orders/limit.py), плюс 30 секунд запаса на латентность и рассинхрон часов.
+# TTL короче этого минимума означает, что ни один GTD-ордер не подпишется.
+MIN_GTD_TTL_S = 180 + 30
+
+
 def shares_to_base_units(shares: Decimal) -> int:
     """Перевести shares в базовые единицы ERC-1155 (округление вниз)."""
     if shares <= 0:
@@ -155,6 +162,27 @@ class Book:
 
 
 @dataclass(slots=True)
+class Fill:
+    """
+    Исполнение НАШЕГО ордера, приведённое к нашей перспективе.
+
+    В событии trade user-канала верхнеуровневые side/price описывают
+    тейкера; наша сторона сделки (мы всегда post_only-мейкер) лежит в
+    maker_orders. execution.py разбирает событие и отдаёт движку уже
+    готовый Fill — чтобы перспектива не перепутывалась дальше по коду.
+    """
+
+    trade_id: str
+    condition_id: str
+    token_id: str
+    side: Side
+    price: Decimal
+    size: Decimal
+    fee_rate_bps: Decimal | None = None
+    ts: float = field(default_factory=time.time)
+
+
+@dataclass(slots=True)
 class Quote:
     """Желаемый лимитный ордер."""
 
@@ -277,6 +305,33 @@ class MarketPosition:
         self.yes_size -= size
         self.no_size -= size
         self.merged_pairs += size
+
+    def correct_side(
+        self, outcome: Outcome, exchange_size: Decimal, exchange_avg: Decimal | None
+    ) -> None:
+        """
+        Скорректировать одну сторону к данным биржи (периодическая сверка).
+
+        Коррекция — не сделка: realized_pnl не трогаем. Средняя цена
+        сохраняется наша, если сторона была ненулевой; иначе берём среднюю
+        биржи; иначе 1.0 за share — верхняя граница, завышающая нотионал,
+        то есть ошибающаяся в сторону более строгих лимитов.
+        """
+        new_size = max(ZERO, exchange_size)
+        cur_size = self.yes_size if outcome == "YES" else self.no_size
+        cur_cost = self.yes_cost if outcome == "YES" else self.no_cost
+        if cur_size > 0:
+            avg = cur_cost / cur_size
+        elif exchange_avg and exchange_avg > 0:
+            avg = exchange_avg
+        else:
+            avg = ONE
+        if outcome == "YES":
+            self.yes_size = new_size
+            self.yes_cost = avg * new_size
+        else:
+            self.no_size = new_size
+            self.no_cost = avg * new_size
 
     def apply_recovered(
         self, outcome: Outcome, size: Decimal, avg_price: Decimal | None
