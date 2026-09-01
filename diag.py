@@ -44,7 +44,13 @@ from decimal import Decimal
 from polymarket import AsyncPublicClient
 
 from src.config import StrategySettings
-from src.discovery import MarketDiscovery, _parse_ts, detect_asset
+from src.discovery import (
+    PRICE_RE,
+    MarketDiscovery,
+    _parse_ts,
+    detect_asset,
+    parse_slug_start_ts,
+)
 
 # Маркеры интересных серий/событий в слагах и заголовках.
 MARKERS = ("up-or-down", "up or down", "up/down", "updown", "up-down", "twap")
@@ -138,6 +144,21 @@ def print_market(m, ev_title: str, now: float, cfg: StrategySettings) -> bool:  
     no_label = getattr(no, "label", "?")
     print(f"    token {yes_label}: {getattr(yes, 'token_id', None) or '—'}")
     print(f"    token {no_label}:  {getattr(no, 'token_id', None) or '—'}")
+
+    # Подсказки для страйка: время старта окна из слага и числа из описания.
+    # По ним видно, отдаёт ли API опорную цену прямо в полях рынка.
+    start_ts = parse_slug_start_ts(str(getattr(m, "slug", "") or ""))
+    if start_ts is not None:
+        delta = now - start_ts
+        when = f"{delta:.0f}с назад" if delta >= 0 else f"через {-delta:.0f}с"
+        print(f"    старт окна из слага: {start_ts:.0f} ({when})")
+    description = str(getattr(m, "description", "") or "")
+    numbers = [match.group(1) for match in PRICE_RE.finditer(description)][:5]
+    if numbers:
+        print(f"    числа в описании (кандидаты в страйк): {', '.join(numbers)}")
+    elif description:
+        print("    описание есть, но чисел (страйка) в нём нет")
+
     print(f"    вердикт: {verdict}")
     return verdict.startswith("✓")
 
@@ -154,8 +175,12 @@ def load_strategy_settings() -> StrategySettings:
 async def section_exact_bot_queries(
     client: AsyncPublicClient, cfg: StrategySettings
 ) -> list:
-    """Раздел 2: точные запросы бота по слагам серий."""
-    print("\n=== 2. Точные запросы бота: list_series(slug=...) =============")
+    """Раздел 2: точные запросы бота по слагам серий (резервный путь)."""
+    print("\n=== 2. Резервный путь бота: list_series(slug=...) =============")
+    if not cfg.series_slugs:
+        print("  (слаги серий не настроены — основной путь бота title_search, "
+              "резерв отключён; это дефолт)")
+        return []
     events: list = []
     for slug in cfg.series_slugs:
         try:
@@ -224,8 +249,8 @@ async def section_scan_series(
 async def section_title_probes(
     client: AsyncPublicClient, cfg: StrategySettings
 ) -> list:
-    """Раздел 4: list_events по вариантам заголовка."""
-    print("\n=== 4. list_events(title_search=...) по вариантам заголовка ====")
+    """Раздел 4: list_events по вариантам заголовка (ОСНОВНОЙ путь бота)."""
+    print("\n=== 4. ОСНОВНОЙ путь: list_events(title_search=...) ============")
     probes: list[str] = []
     for probe in list(cfg.title_keywords) + list(EXTRA_TITLE_PROBES):
         if probe.lower() not in {p.lower() for p in probes}:

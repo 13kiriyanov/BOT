@@ -67,6 +67,9 @@ class RegimeState:
     fills_in_window: int
     vol_ratio: float | None
     autocorr: float | None
+    # Готовность вол-сигнала: без неё vol_ratio == None ГЕЙТИТСЯ, а не
+    # отсутствует. Ложь = сигнал ещё прогревается и решений не принимает.
+    vol_ready: bool = False
 
 
 class _EwmaVar:
@@ -123,11 +126,22 @@ class RegimeDetector:
         vol_ratio_exit: float = 1.35,
         vol_fast_halflife_s: float = 20.0,
         vol_slow_halflife_s: float = 300.0,
-        # Сигнал волатильности молчит, пока медленная база не прогрета:
-        # EWMA с полупериодом 300 с после пары минут всё ещё взвешена в
-        # пользу первых сэмплов, и отношение fast/slow на прогреве шумит
-        # до ложных VOLATILE. Дефолт = полупериод медленной EWMA в тиках.
+        # ГОТОВНОСТЬ вол-сигнала — ДВА независимых условия, оба обязательны.
+        # 1) Минимум сэмплов: защита от решений на паре тиков.
+        # 2) Минимум ПРОШЕДШЕГО времени данных: живой фид даёт 5-20 тиков/с,
+        #    и 300 сэмплов набираются за полминуты — а медленная EWMA с
+        #    полупериодом 300 с к этому моменту всё ещё прибита к первым
+        #    сэмплам, отношение fast/slow систематически завышено (вживую:
+        #    2.7-2.8 по обоим активам сразу после старта => ложный VOLATILE,
+        #    который глушил котирование полностью). Один счётчик тиков от
+        #    этого не защищает — тики не измеряют прогрев EWMA, его измеряет
+        #    время. При elapsed >= полупериода медленной EWMA остаточный вес
+        #    первого сэмпла <= 50%, и завышение отношения ограничено sqrt(2)
+        #    < порога входа 1.8. Пока сигнал не готов — он НЕДОСТУПЕН
+        #    (None), и режим по воле не назначается: гейт без данных — не
+        #    гейт, а выключатель.
         vol_min_samples: int = 300,
+        vol_min_elapsed_s: float | None = None,  # None => полупериод slow EWMA
         bar_s: float = 1.0,
         # Минимальное удержание TRENDING после входа. Реакция котирования
         # снимает/отодвигает заваленную сторону, то есть ДУШИТ сам поток
@@ -152,6 +166,9 @@ class RegimeDetector:
         self.vol_ratio_enter = vol_ratio_enter
         self.vol_ratio_exit = vol_ratio_exit
         self.vol_min_samples = vol_min_samples
+        self.vol_min_elapsed_s = (
+            vol_slow_halflife_s if vol_min_elapsed_s is None else vol_min_elapsed_s
+        )
         self.bar_s = bar_s
         self.min_hold_s = min_hold_s
 
@@ -161,6 +178,7 @@ class RegimeDetector:
         self._slow = _EwmaVar(vol_slow_halflife_s)
         self._last_price: float | None = None
         self._last_ts: float | None = None
+        self._first_spot_ts: float | None = None
         # 1-секундные бары для автокорреляции. Значение кэшируется и
         # пересчитывается только при закрытии нового бара: O(N) на каждый
         # тик превратил бы прогон симулятора из секунд в минуты.
@@ -188,6 +206,7 @@ class RegimeDetector:
             autocorr_enter=s.regime_autocorr_enter,
             vol_ratio_enter=s.regime_vol_ratio_enter,
             vol_ratio_exit=s.regime_vol_ratio_exit,
+            vol_min_elapsed_s=s.regime_vol_min_elapsed_s,
             min_hold_s=s.regime_min_hold_s,
         )
 
@@ -206,6 +225,8 @@ class RegimeDetector:
         """Учесть тик спота: вола (быстрая/медленная) и бары автокорреляции."""
         if price <= 0:
             return
+        if self._first_spot_ts is None:
+            self._first_spot_ts = ts
         if self._last_price is not None and self._last_ts is not None:
             dt = ts - self._last_ts
             if 0 < dt <= 30.0:
@@ -245,15 +266,28 @@ class RegimeDetector:
             side = "NO"
         return abs(net) / total, len(self._fills), side
 
-    def _vol_ratio(self) -> float | None:
+    def _vol_ready(self) -> bool:
+        """Оба условия прогрева: достаточно сэмплов И достаточно времени."""
+        if self._slow.samples < self.vol_min_samples:
+            return False
+        if self._first_spot_ts is None or self._last_ts is None:
+            return False
+        return (self._last_ts - self._first_spot_ts) >= self.vol_min_elapsed_s
+
+    def _vol_ratio_raw(self) -> float | None:
+        """Отношение без гейта прогрева — ТОЛЬКО для наблюдаемости в логах."""
         if (
             self._fast.value is None
             or self._slow.value is None
             or self._slow.value <= 0
-            or self._slow.samples < self.vol_min_samples
         ):
             return None
         return math.sqrt(self._fast.value / self._slow.value)
+
+    def _vol_ratio(self) -> float | None:
+        if not self._vol_ready():
+            return None
+        return self._vol_ratio_raw()
 
     def _autocorr(self) -> float | None:
         if len(self._bar_returns) < self.autocorr_min_bars:
@@ -335,16 +369,22 @@ class RegimeDetector:
             fills_in_window=fills_n,
             vol_ratio=self._vol_ratio(),
             autocorr=self._autocorr(),
+            vol_ready=self._vol_ready(),
         )
 
     def snapshot(self) -> dict:
         """Метрики для status-лога."""
         s = self.state()
+        raw = self._vol_ratio_raw()
         return {
             "regime": s.regime.value,
             "crowded": s.crowded_side,
             "imbalance": round(s.imbalance, 3),
             "fills": s.fills_in_window,
             "vol_ratio": round(s.vol_ratio, 3) if s.vol_ratio is not None else None,
+            # Сырое отношение видно и ДО готовности: по нему в логе видно,
+            # что гейт прогрева реально сдержал (vol_ready=False, raw > 1.8).
+            "vol_ratio_raw": round(raw, 3) if raw is not None else None,
+            "vol_ready": s.vol_ready,
             "autocorr": round(s.autocorr, 3) if s.autocorr is not None else None,
         }

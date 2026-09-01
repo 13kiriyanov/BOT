@@ -252,6 +252,96 @@ def test_paginator_iterates_pages_not_items():
     assert getattr(pages[0], "markets", None) is None
 
 
+# ------------------------------------------- RTDS: crypto prices (спот-фид)
+
+
+def test_crypto_prices_payload_shape_and_filter_contract():
+    """
+    price_feed.run_polymarket: payload несёт symbol (регистр НЕ нормализован
+    моделью) и value (Decimal). Фильтр symbols подписки — КЛИЕНТСКИЙ и
+    сравнивает строки ТОЧНО, без .lower() (в отличие от equity-фильтра):
+    spec с "BTCUSDT" при wire-символе "btcusdt" молча отбрасывает каждое
+    событие ещё в SDK — подписка «работает», ingest() не вызывается ни разу,
+    все рынки блокируются по «спот-фид протух». Поэтому мы подписываемся на
+    весь топик (symbols не передаём) и фильтруем сами через
+    normalize_rtds_symbol. Если канарейка упала после обновления SDK —
+    перепроверь и форму payload, и семантику фильтра руками.
+    """
+    from polymarket._internal.streams.rtds.protocol import matcher_for
+    from polymarket.models.rtds_events import CryptoPricesBinanceEvent
+    from polymarket.streams import CryptoPricesSpec
+
+    ev = CryptoPricesBinanceEvent.model_validate({
+        "type": "update", "timestamp": 1788276000000,
+        "payload": {"symbol": "btcusdt", "timestamp": 1788276000,
+                    "value": "109521.55"},
+    })
+    assert ev.payload.symbol == "btcusdt"        # как пришло, без upper()
+    assert ev.payload.value == D("109521.55")
+
+    # Спека допускает подписку на весь топик — на этом стоит наш фикс.
+    assert CryptoPricesSpec(topic="prices.crypto.binance").symbols is None
+
+    # Сам механизм бага, закреплённый как контракт: точечный фильтр в
+    # верхнем регистре НЕ пропускает wire-событие в нижнем.
+    uppercase_filter = matcher_for(
+        CryptoPricesSpec(topic="prices.crypto.binance", symbols=["BTCUSDT"])
+    )
+    assert uppercase_filter(ev) is False
+    topic_wide = matcher_for(CryptoPricesSpec(topic="prices.crypto.binance"))
+    assert topic_wide(ev) is True
+
+    from src.price_feed import POLY_SYMBOLS, normalize_rtds_symbol
+
+    for wire in ("btcusdt", "BTCUSDT", "BTC/USDT", "btc-usdt", "BTC/USD"):
+        assert POLY_SYMBOLS[normalize_rtds_symbol(wire)] == "BTC", wire
+
+
+# ------------------------------------- market-стрим: book / price_change
+
+
+def test_market_stream_payload_shape():
+    """
+    orderbook._handle_event: имена полей, которые читает зеркало стакана.
+    type ('book'/'price_change'/'best_bid_ask'), payload.token_id (алиас
+    asset_id), bids/asks с price/size, price_changes[] со своими
+    token_id/price/size/side (side нормализуется к верхнему регистру).
+    """
+    from polymarket.models.clob.market_events import (
+        MarketBestBidAskEvent,
+        MarketBookEvent,
+        MarketPriceChangeEvent,
+    )
+
+    book = MarketBookEvent.model_validate({
+        "type": "book",
+        "payload": {"market": CONDITION, "asset_id": "123",
+                    "bids": [{"price": "0.49", "size": "100"}],
+                    "asks": [{"price": "0.51", "size": "80"}]},
+    })
+    assert book.type == "book"
+    assert book.payload.token_id == "123"
+    level = book.payload.bids[0]
+    assert (level.price, level.size) == (D("0.49"), D("100"))
+
+    pc = MarketPriceChangeEvent.model_validate({
+        "type": "price_change",
+        "payload": {"market": CONDITION,
+                    "price_changes": [{"asset_id": "123", "price": "0.50",
+                                       "size": "0", "side": "buy"}]},
+    })
+    change = pc.payload.price_changes[0]
+    assert (change.token_id, change.price, change.size) == ("123", D("0.50"), D("0"))
+    assert change.side == "BUY"
+
+    bba = MarketBestBidAskEvent.model_validate({
+        "type": "best_bid_ask",
+        "payload": {"market": CONDITION, "asset_id": "123",
+                    "best_bid": "0.49", "best_ask": "0.51"},
+    })
+    assert (bba.payload.best_bid, bba.payload.best_ask) == (D("0.49"), D("0.51"))
+
+
 # ----------------------------------------------- user-stream: событие trade
 
 

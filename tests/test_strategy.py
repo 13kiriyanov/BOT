@@ -15,6 +15,7 @@ from src.fair_value import FairValueModel, VolatilityEstimator, _norm_cdf
 from src.models import (
     Book,
     BookLevel,
+    FairValue,
     MarketPosition,
     RecoveredPosition,
     TargetMarket,
@@ -54,6 +55,10 @@ class StratCfg:
     regime_vol_ratio_enter = 1.8
     regime_vol_ratio_exit = 1.35
     regime_min_hold_s = 45.0
+    regime_vol_min_elapsed_s = 300.0
+    strike_divergence_threshold = D("0.25")
+    strike_divergence_hold_s = 8.0
+    pair_sum_warn_gap = D("0.05")
 
 
 class RiskCfg:
@@ -747,3 +752,56 @@ def test_microprice_leans_toward_thin_side():
     )
     # Огромный ask давит цену вниз относительно mid 0.51.
     assert book.microprice() < book.mid
+
+
+# ------------------------------------- диагностика сломанного fair value
+
+
+def test_pair_sum_far_below_target_warns_but_still_quotes(market, caplog):
+    """
+    Fair съехал от рынка (ложный страйк + клип): каждую ногу зажимает её
+    стакан далеко от резервной цены, сумма пары падает сильно ниже цели.
+    Инвариант сверху цел, но экономически котировки мертвы — обязателен
+    WARNING (без блокировки котирования и без спама: не чаще раза в 30 с).
+    """
+    import logging as _logging
+
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    fv = FairValue(
+        fair=D("0.44"), model_prob=D("0.96"), market_mid=D("0.28"),
+        edge=D("0.68"), sigma_annual=D("0.45"), confidence=D("1"),
+    )
+    yes = Book(token_id="tok_yes",
+               bids=[BookLevel(D("0.27"), D("100"))],
+               asks=[BookLevel(D("0.29"), D("100"))], updated_at=time.time())
+    no = Book(token_id="tok_no",
+              bids=[BookLevel(D("0.71"), D("100"))],
+              asks=[BookLevel(D("0.73"), D("100"))], updated_at=time.time())
+    pos = MarketPosition("0xcond")
+
+    with caplog.at_level(_logging.WARNING, logger="polybot.quote"):
+        quotes = q.build_quotes(market, fv, pos, yes, no)
+        quotes_again = q.build_quotes(market, fv, pos, yes, no)
+
+    assert len(quotes) == 2                     # диагностика не блокирует
+    pair_sum = sum(quote.price for quote in quotes)
+    assert pair_sum < StratCfg.target_pair_cost - StratCfg.pair_sum_warn_gap
+    warned = [r for r in caplog.records if "ниже цели" in r.message]
+    assert len(warned) == 1                     # антиспам: второй вызов молчит
+    assert quotes_again                          # но котирует по-прежнему
+
+
+def test_healthy_pair_sum_does_not_warn(market, books, caplog):
+    """Нормальная пара у цели — никаких предупреждений."""
+    import logging as _logging
+
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    yes, no = books
+    fv = FairValue(
+        fair=D("0.51"), model_prob=D("0.51"), market_mid=D("0.51"),
+        edge=D("0"), sigma_annual=D("0.45"), confidence=D("1"),
+    )
+    with caplog.at_level(_logging.WARNING, logger="polybot.quote"):
+        quotes = q.build_quotes(market, fv, MarketPosition("0xcond"), yes, no)
+    assert len(quotes) == 2
+    assert not [r for r in caplog.records if "ниже цели" in r.message]

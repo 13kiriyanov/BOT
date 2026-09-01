@@ -26,7 +26,7 @@ from decimal import Decimal
 from polymarket import AsyncSecureClient
 
 from .config import Settings
-from .discovery import MarketDiscovery
+from .discovery import MarketDiscovery, implied_strike
 from .execution import OrderManager
 from .fair_value import FairValueModel
 from .logging_setup import log_event
@@ -63,6 +63,18 @@ POSITION_SYNC_INTERVAL_S = 60.0
 # читается list_positions(), отстаёт от CLOB на секунды, и сразу после
 # исполнения «расхождение» — это лаг индексатора, а не ошибка учёта.
 SYNC_ACTIVITY_GUARD_S = 90.0
+
+# --- Калибровка страйка по живым данным -------------------------------------
+# Спот «в момент открытия окна» засчитывается, только если мы поймали
+# пересечение start_ts не позже, чем через столько секунд (quote_loop
+# крутится каждые ~0.35 с, так что обычно ловим в первом же цикле).
+WINDOW_OPEN_TOLERANCE_S = 3.0
+# Инверсию модели по mid не делаем ближе к экспирации: d ~ 1/sqrt(tau),
+# и K становится гиперчувствителен к шуму mid.
+STRIKE_CALIB_MIN_SECONDS = 45.0
+# ...и при экстремальном mid: наклон inv_cdf на краях огромен, ошибка
+# в полтика mid превращается в ошибку страйка в десятки долларов.
+STRIKE_CALIB_MID_BAND = (0.10, 0.90)
 
 
 class TradingEngine:
@@ -103,6 +115,10 @@ class TradingEngine:
         # (rate, exponent). discovery пересоздаёт объекты рынков каждый цикл,
         # и без этого словаря знание терялось бы через 20 секунд.
         self._fee_overrides: dict[str, tuple[Decimal, Decimal]] = {}
+        # Состояние сторожа страйка: condition_id -> {"diverged_since",
+        # "invalidations", "blocked"}. blocked=True — модель по рынку
+        # отключена до конца окна (страйк дважды признан невалидным).
+        self._strike_meta: dict[str, dict] = {}
         # Момент последнего филла или merge по рынку: сверка позиций не
         # трогает рынки со свежей активностью (data-api отстаёт от CLOB).
         self._last_activity: dict[str, float] = {}
@@ -507,6 +523,7 @@ class TradingEngine:
             await self.orders.cancel(stale)  # type: ignore[union-attr]
         self.discovery.forget(market.condition_id)  # type: ignore[union-attr]
         self.markout.forget_market(market.condition_id)
+        self._strike_meta.pop(market.condition_id, None)
 
     def _book_for(self, market: TargetMarket, outcome: str) -> Book | None:
         """Стакан токена, при необходимости восстановленный из дополнения."""
@@ -561,6 +578,15 @@ class TradingEngine:
         if yes_book is None:
             return []
 
+        # --- страйк: блокировка сторожем / отложенная калибровка ---------
+        meta = self._strike_meta.get(market.condition_id)
+        if meta is not None and meta.get("blocked"):
+            # Дважды невалиден: модель для рынка выключена до конца окна,
+            # даже если discovery пересобрал рынок с тем же страйком.
+            market.strike = None
+        elif market.strike is None:
+            self._try_calibrate_strike(market, yes_book)
+
         # --- проверки допуска -------------------------------------------
         price_stale = self.spot.is_stale(market.asset, self.cfg.risk.stale_price_timeout_s)
         book_stale = yes_book.is_stale(self.cfg.risk.stale_book_timeout_s)
@@ -602,10 +628,26 @@ class TradingEngine:
                 vol_ready=self.spot.vol_ready(market.asset),
             )
 
+        # Сторож расхождения: модель, устойчиво спорящая с рынком на порог,
+        # означает ложный страйк. Клип max_model_deviation в этом случае НЕ
+        # защита: он оставляет fair сдвинутым на всю величину клипа, и обе
+        # ноги котируются там, где их никогда не исполнят.
+        if market.strike is not None and float(fv.confidence) > 0:
+            if self._check_model_divergence(market, fv, mid, spot):
+                # Страйк только что снят — пересчитываем fair чистым MM
+                # по рынку, не дожидаясь следующего цикла.
+                fv = self.fv_model.compute(
+                    spot=1.0, strike=1.0, seconds_left=market.seconds_left,
+                    market_mid=mid, sigma_annual=0.5,
+                    drift_per_second=0.0, vol_ready=False,
+                )
+
         log.debug(
-            "[%s] mid=%.4f model=%.4f fair=%.4f edge=%+.4f sigma=%.2f conf=%.2f net=%s",
+            "[%s] mid=%.4f model=%.4f fair=%.4f edge=%+.4f sigma=%.2f conf=%.2f "
+            "net=%s spot=%s strike=%s",
             market.slug, float(mid), float(fv.model_prob), float(fv.fair),
             float(fv.edge), float(fv.sigma_annual), float(fv.confidence), pos.net,
+            f"{spot:.2f}" if spot is not None else "-", market.strike or "-",
         )
 
         # --- разгрузка, если инвентарь перекошен -------------------------
@@ -638,6 +680,126 @@ class TradingEngine:
                 q.size = size
                 result.append(q)
         return result
+
+    # ------------------------------------------------- страйк: живые данные
+
+    def _try_calibrate_strike(self, market: TargetMarket, yes_book: Book | None) -> None:
+        """
+        Определить страйк по живым данным — отложенно, а не один раз при
+        обнаружении рынка. При старте бота спот-фид ещё пуст и вол не
+        прогрета: калибровка в discovery либо не срабатывала вовсе (страйк
+        None у всех рынков, модель зажата в 0.5), либо срабатывала по
+        устаревшим REST-данным и кэшировала ошибку навсегда.
+
+        Два источника, по убыванию надёжности:
+        1. Спот ровно в момент start_ts (открытие окна) — это определение
+           страйка Up/Down-рынка.
+        2. Инверсия GBM по живому mid нашего стакана, свежему споту и живой
+           вол-оценке — только после открытия окна, не у экспирации и не на
+           экстремальном mid.
+        """
+        cid = market.condition_id
+        meta = self._strike_meta.get(cid)
+        if meta is not None and meta.get("blocked"):
+            # Дважды невалиден — новые страйки для рынка не создаём вовсе.
+            return
+        now = time.time()
+        spot = self.spot.price(market.asset)
+        spot_fresh = spot is not None and not self.spot.is_stale(
+            market.asset, self.cfg.risk.stale_price_timeout_s
+        )
+
+        # 1. Пересечение открытия окна: спот сейчас и есть страйк.
+        if (
+            market.start_ts is not None
+            and spot_fresh
+            and 0.0 <= now - market.start_ts <= WINDOW_OPEN_TOLERANCE_S
+        ):
+            strike = Decimal(str(round(spot, 2)))  # type: ignore[arg-type]
+            market.strike = strike
+            if self.discovery is not None:
+                self.discovery.observe_window_open(cid, strike)
+                self.discovery.set_strike(cid, strike)
+            log.info(
+                "[%s] Страйк из наблюдения открытия окна: %s (spot=%.2f)",
+                market.slug, strike, spot,
+            )
+            return
+
+        # 2. Инверсия модели по живому рынку.
+        if not spot_fresh or market.seconds_left < STRIKE_CALIB_MIN_SECONDS:
+            return
+        if market.start_ts is not None and now < market.start_ts:
+            # До открытия окна mid не несёт информации о будущем страйке.
+            return
+        if not self.spot.vol_ready(market.asset) or yes_book is None:
+            return
+        mid = yes_book.microprice() or yes_book.mid
+        if mid is None:
+            return
+        lo, hi = STRIKE_CALIB_MID_BAND
+        if not (lo <= float(mid) <= hi):
+            return
+        sigma = self.spot.sigma(market.asset)
+        strike = implied_strike(spot, float(mid), market.seconds_left, sigma)  # type: ignore[arg-type]
+        if strike is None:
+            return
+        market.strike = strike
+        if self.discovery is not None:
+            self.discovery.set_strike(cid, strike)
+        log.info(
+            "[%s] Страйк калиброван по живому рынку: K=%s (spot=%.2f mid=%.4f "
+            "sigma=%.2f)", market.slug, strike, spot, float(mid), sigma,
+        )
+
+    def _check_model_divergence(
+        self, market: TargetMarket, fv, mid: Decimal, spot: float | None
+    ) -> bool:  # noqa: ANN001 - fv: FairValue
+        """
+        Сторож валидности страйка. True — страйк только что признан ложным.
+
+        Триггер — УСТОЙЧИВОЕ расхождение: |model - mid| выше порога дольше
+        strike_divergence_hold_s подряд (разовый выброс сбрасывает таймер).
+        Реакция — отключить модель для рынка (чистый MM по рынку), а не
+        клипать её: это направление отказа безопасно. После второго срыва —
+        блок до конца окна: страйк из тех же источников будет так же ложным.
+        """
+        threshold = float(self.cfg.strategy.strike_divergence_threshold)
+        divergence = abs(float(fv.model_prob) - float(mid))
+        meta = self._strike_meta.setdefault(
+            market.condition_id,
+            {"diverged_since": None, "invalidations": 0, "blocked": False},
+        )
+        now = time.time()
+
+        if divergence < threshold:
+            meta["diverged_since"] = None
+            return False
+        since = meta["diverged_since"]
+        if since is None:
+            meta["diverged_since"] = now
+            return False
+        if now - since < self.cfg.strategy.strike_divergence_hold_s:
+            return False
+
+        meta["diverged_since"] = None
+        meta["invalidations"] += 1
+        log.warning(
+            "[%s] Модель устойчиво расходится с рынком %.1f с: model=%.3f "
+            "mid=%.3f strike=%s spot=%s — страйк невалиден, модель отключена",
+            market.slug, now - since, float(fv.model_prob), float(mid),
+            market.strike, f"{spot:.2f}" if spot is not None else "-",
+        )
+        market.strike = None
+        if self.discovery is not None:
+            self.discovery.invalidate_strike(market.condition_id)
+        if meta["invalidations"] >= 2:
+            meta["blocked"] = True
+            log.warning(
+                "[%s] Страйк невалиден повторно — модель для рынка отключена "
+                "до конца окна", market.slug,
+            )
+        return True
 
     def _unwind_if_needed(
         self,

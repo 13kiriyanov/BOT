@@ -76,6 +76,10 @@ class SimStrat:
     regime_vol_ratio_enter = 1.8
     regime_vol_ratio_exit = 1.35
     regime_min_hold_s = 45.0
+    regime_vol_min_elapsed_s = 300.0
+    # В симуляторе fair всегда рядом с рынком, диагностика суммы пары не
+    # нужна: 0 отключает WARNING, чтобы не шуметь на тысячах окон.
+    pair_sum_warn_gap = D("0")
 
 
 class SimRisk:

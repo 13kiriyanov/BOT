@@ -78,6 +78,8 @@ side/price/size — его; наша мейкерская нога лежит в
 | user-stream trade → price/size | человеческие; верхний уровень — тейкер, наша нога в maker_orders | `test_user_trade_payload_units_and_maker_shape` |
 | `subscribe(spec)` | КОРУТИНА: `async with await client.subscribe(...)`; без await все стримы мертвы | `test_subscribe_is_a_coroutine_returning_handle` |
 | любой `list_*()` (пагинатор) | `async for` отдаёт ОБЪЕКТЫ Page; элементы — только через `.iter_items()`. Забытый iter_items не падает: getattr по Page молча даёт пустоту — «рынков/позиций/ордеров нет» | `test_paginator_iterates_pages_not_items` |
+| crypto-стрим (CryptoPricesSpec) | payload.symbol/value; фильтр symbols — КЛИЕНТСКИЙ, точное сравнение строк без нормализации регистра: несовпадение формата молча убивает весь фид. Подписка топиковая (symbols не передаём), нормализация наша | `test_crypto_prices_payload_shape_and_filter_contract` |
+| market-стрим (book/price_change/best_bid_ask) | payload.token_id (алиас asset_id), bids/asks c price/size, price_changes[] со своими token_id/price/size/side | `test_market_stream_payload_shape` |
 
 ## Карта модулей
 
@@ -156,8 +158,20 @@ API без ключей и ордеров, печатает актуальные
    не даёт |net| дойти до жёсткого лимита (свип в README). Реальный
    рычаг защиты от тренда — STRAT_DIRECTIONAL_MAX_NET, и его ужесточение
    оплачено оборотом спокойных окон почти один в один.
-8. Дефолтные слаги серий (`bitcoin-up-or-down`, `ethereum-up-or-down`) не
-   сверены с живым API: из среды разработки сеть к Polymarket закрыта, а на
-   сайте фигурируют «Up/Down TWAP» рынки. Прогнать `python diag.py` с
-   машины с доступом и, если скан покажет другие слаги, обновить
-   STRAT_SERIES_SLUGS/STRAT_TITLE_KEYWORDS (раздел 3-4 вывода diag).
+8. Живые рынки: `btc-updown-5m-<ts>`, `eth-updown-5m-<ts>`, `*-15m-*` —
+   их находит title_search (основной путь). Слаги СЕРИЙ для них неизвестны
+   (list_series по старым слагам стабильно пуст), поэтому путь через серии
+   переведён в резерв, а дефолт STRAT_SERIES_SLUGS — пустой. Если рабочие
+   слаги серий найдутся (раздел 3 diag.py), их можно вернуть в конфиг.
+9. Семантика резолюции updown-рынков не подтверждена: если рынок резолвится
+   по TWAP окна (на сайте фигурирует «Up/Down TWAP»), GBM-модель точки
+   конца окна структурно смещена — сторож расхождения отключит модель, но
+   правильной моделью было бы среднее по окну, а не конечная цена. Проверить
+   по description живого рынка (`diag.py` печатает числа из описания) и по
+   первому дню dry run: если сторож стабильно отстреливает страйк на всех
+   рынках — дело, скорее всего, в этом.
+10. Отложенная калибровка страйка инверсией GBM самонадеянна на первых
+   рынках после старта: sigma ещё floor-смешанная (см. VolatilityEstimator),
+   K получает ошибку порядка sigma-ошибки. Сторож это ловит постфактум;
+   до его срабатывания модель успевает поторговать со смещённым центром
+   в пределах max_model_deviation.

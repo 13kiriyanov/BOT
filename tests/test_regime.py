@@ -224,3 +224,59 @@ def test_sell_fills_contribute_with_inverted_sign():
         det.on_fill("YES", "SELL", D("20"), ts + i * 0.5)
     assert det.regime == Regime.TRENDING
     assert det.state().crowded_side == "NO"
+
+
+def test_live_startup_tick_rate_does_not_fake_volatile():
+    """
+    ЖИВОЙ профиль старта, а не синтетика по тику в секунду: 3-20 тиков/с со
+    случайными интервалами, первые ~30 с тише обычного (коннект, редкий
+    поток), затем нормальная активность. Счётчик сэмплов (300) набирается
+    за полминуты, когда медленная EWMA ещё прибита к тихому началу, — сырое
+    отношение fast/slow взлетает выше порога входа. Ровно это наблюдалось
+    вживую: vol_ratio 2.7-2.8 по обоим активам при fills=0 сразу после
+    старта, и VOLATILE_NO_QUOTE глушил бота полностью.
+
+    Контракт: до прогрева ПО ВРЕМЕНИ сигнал недоступен и режим CALM; после
+    прогрева гейт не превращается в выключатель — настоящий всплеск даёт
+    VOLATILE.
+    """
+    det = RegimeDetector()   # боевые дефолты: enter=1.8, samples=300, elapsed=300
+    rng = random.Random(42)
+    state = {"price": 109_500.0, "ts": 1_000_000.0}
+
+    def tick(amplitude: float) -> None:
+        dt = rng.uniform(0.05, 0.3)             # 3-20 тиков в секунду
+        state["ts"] += dt
+        state["price"] *= 1.0 + rng.gauss(0.0, amplitude * math.sqrt(dt))
+        det.on_spot(state["price"], state["ts"])
+
+    t0 = state["ts"]
+    while state["ts"] < t0 + 30.0:              # тихий старт
+        tick(2e-5)
+    while state["ts"] < t0 + 90.0:              # нормальная активность
+        tick(8e-5)
+
+    snap = det.snapshot()
+    # Опасность реально воспроизведена: сэмплов уже «достаточно», сырое
+    # отношение выше порога входа — старый гейт по одним сэмплам пропустил
+    # бы ложный VOLATILE.
+    assert det._slow.samples >= det.vol_min_samples
+    assert snap["vol_ratio_raw"] is not None
+    assert snap["vol_ratio_raw"] >= det.vol_ratio_enter, (
+        f"профиль не воспроизвёл опасность: raw={snap['vol_ratio_raw']}"
+    )
+    # ...но сигнал по времени ещё не готов: он недоступен, режим CALM.
+    assert snap["vol_ready"] is False
+    assert snap["vol_ratio"] is None
+    assert det.regime == Regime.CALM
+
+    # Догрев нормальной активностью до порога времени: готов, и всё ещё CALM.
+    while state["ts"] < t0 + det.vol_min_elapsed_s + 5.0:
+        tick(8e-5)
+    assert det.snapshot()["vol_ready"] is True
+    assert det.regime == Regime.CALM
+
+    # Настоящий всплеск (амплитуда x10) после прогрева обязан сработать.
+    for _ in range(400):
+        tick(8e-4)
+    assert det.regime == Regime.VOLATILE
