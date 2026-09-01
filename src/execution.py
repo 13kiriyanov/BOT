@@ -484,7 +484,8 @@ class OrderManager:
         try:
             found: dict[tuple[str, str], LiveOrder] = {}
             by_id: dict[str, tuple[str, str]] = {}
-            async for o in self.client.list_open_orders():
+            # Пагинатор итерируется страницами — элементы через iter_items().
+            async for o in self.client.list_open_orders().iter_items():
                 order = LiveOrder(
                     order_id=str(o.id),
                     token_id=str(o.token_id),

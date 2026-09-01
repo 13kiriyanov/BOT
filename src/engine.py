@@ -178,7 +178,8 @@ class TradingEngine:
     async def _fetch_positions(self) -> list[RecoveredPosition]:
         """Прочитать открытые позиции кошелька и привести к нашим моделям."""
         found: list[RecoveredPosition] = []
-        async for p in self.client.list_positions():  # type: ignore[union-attr]
+        # Пагинатор итерируется страницами — элементы через iter_items().
+        async for p in self.client.list_positions().iter_items():  # type: ignore[union-attr]
             rec = RecoveredPosition.from_api(p)
             if rec is None:
                 continue
@@ -450,6 +451,13 @@ class TradingEngine:
                     a: p for a in ("BTC", "ETH") if (p := self.spot.price(a)) is not None
                 }
                 found = await self.discovery.find_markets(spots)  # type: ignore[union-attr]
+                # Воронка фильтров каждым проходом: «рынков=0 потому что
+                # кандидатов не было» и «кандидаты были, но все отсеялись»
+                # должны различаться прямо в логе, без дебага.
+                log.info(
+                    "discovery: %s",
+                    self.discovery.last_funnel.describe(),  # type: ignore[union-attr]
+                )
 
                 new_map = {m.condition_id: m for m in found}
                 added = set(new_map) - set(self.markets)
@@ -802,7 +810,8 @@ class TradingEngine:
         """Одна сверка: расхождение больше допуска — предупреждение и
         коррекция к данным биржи; больше order_size*3 — остановка."""
         exchange: dict[str, dict[Outcome, RecoveredPosition]] = {}
-        async for p in self.client.list_positions():  # type: ignore[union-attr]
+        # Пагинатор итерируется страницами — элементы через iter_items().
+        async for p in self.client.list_positions().iter_items():  # type: ignore[union-attr]
             rec = RecoveredPosition.from_api(p)
             if rec is None or rec.redeemable:
                 continue
