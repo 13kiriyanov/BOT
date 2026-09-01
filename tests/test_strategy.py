@@ -258,6 +258,43 @@ def test_round_to_tick():
     assert round_to_tick(D("0.5"), D("0.01")) == D("0.50")
 
 
+# ------------------------------------------------------------- разгрузка
+
+
+def test_unwind_sell_does_not_cross_the_bid(market, books):
+    """
+    Разгрузка — post_only SELL. Цена, равная лучшему биду, marketable:
+    биржа отклонит ордер, и разгрузка не исполнится НИКОГДА. Продаём на
+    тик выше бида — самый агрессивный некроссящий аск.
+    """
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    yes_book, _ = books
+    pos = MarketPosition("0xcond")
+    pos.apply_fill("YES", "BUY", D("0.49"), D("100"))   # net +100
+
+    quotes = q.build_unwind_quotes(market, pos, yes_book)
+    assert len(quotes) == 1
+    quote = quotes[0]
+    assert quote.side == "SELL" and quote.outcome == "YES"
+    assert quote.price > yes_book.best_bid              # не кроссит
+    assert quote.price == yes_book.best_bid + market.tick_size
+    assert quote.size == D("40")                        # min(|net|, 2*order)
+
+
+def test_unwind_at_price_ceiling_returns_nothing(market):
+    """Бид у потолка: некроссящего мейкер-аска не существует — молчим."""
+    book = Book(
+        token_id="tok_yes",
+        bids=[BookLevel(D("0.99"), D("100"))],
+        asks=[],
+        updated_at=time.time(),
+    )
+    pos = MarketPosition("0xcond")
+    pos.apply_fill("YES", "BUY", D("0.90"), D("100"))
+    q = QuoteGenerator(StratCfg(), RiskCfg())
+    assert q.build_unwind_quotes(market, pos, book) == []
+
+
 # --------------------------------------------------------- реакция на режим
 
 

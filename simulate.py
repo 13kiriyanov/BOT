@@ -155,7 +155,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             toxicity: float = 0.35, queue_factor: float = 0.45,
             fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01"),
             trend_prob: float = 0.0, trend_strength: float = 0.0,
-            use_regime: bool = False) -> dict:
+            use_regime: bool = False, use_unwind: bool = True,
+            max_net: float | None = None) -> dict:
     """Одно торговое окно."""
     # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
     # seed и разной toxicity получают одинаковые базовую траекторию спота,
@@ -216,7 +217,14 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         fee_exponent=D("1") if fee_rate > 0 else D("0"),
     )
 
+    # Лимиты как в связке конфигов реального бота: кросс-валидация требует
+    # directional_max_net <= max_net_exposure, поэтому при свипе лимита
+    # порог разгрузки едет вместе с ним.
+    net_cap = float(max_net) if max_net is not None else float(SimRisk.max_net_exposure)
+    unwind_limit_base = min(float(SimStrat.directional_max_net), net_cap)
+
     fills = 0
+    unwound = 0.0
     bought = {"YES": 0.0, "NO": 0.0}
     for step in range(window_s):
         left = window_s - step
@@ -250,10 +258,23 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             drift_per_second=vol.drift_per_second,
             vol_ready=vol.ready,
         )
-        regime_state = detector.state() if detector is not None else None
-        quotes = quoter.build_quotes(
-            market, fv, pos, yes_book, no_book, regime_state
-        )
+        # --- Разгрузка перекоса: точная копия _unwind_if_needed движка ---
+        # Если |net| превысил directional-лимит (у экспирации лимит ужат до
+        # order_size), разгрузочный SELL ЗАМЕНЯЕТ обычные котировки.
+        quotes = None
+        if use_unwind:
+            unwind_limit = unwind_limit_base
+            if left < 60:
+                unwind_limit = min(unwind_limit, float(SimStrat.order_size))
+            if abs(float(pos.net)) > unwind_limit:
+                book = yes_book if pos.net > 0 else no_book
+                quotes = quoter.build_unwind_quotes(market, pos, book) or None
+
+        if quotes is None:
+            regime_state = detector.state() if detector is not None else None
+            quotes = quoter.build_quotes(
+                market, fv, pos, yes_book, no_book, regime_state
+            )
 
         # --- Модель исполнения ------------------------------------------
         # Три эффекта, без которых симуляция врёт в вашу пользу:
@@ -264,9 +285,45 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         #     исполняют ровно перед движением против вас.
         for q in quotes:
             side_size = pos.yes_size if q.outcome == "YES" else pos.no_size
+
+            if q.side == "SELL":
+                # Разгрузочный аск на тик выше бида. Покупателю он выгоден,
+                # когда ниже ценности; в тренде продать заваленную сторону
+                # труднее всего — её никто не покупает (голодание x0.3),
+                # и это главная причина, почему разгрузка не бесплатна.
+                ref = p_mkt if q.outcome == "YES" else 1 - p_mkt
+                through = ref - float(q.price)
+                if through <= 0:
+                    continue
+                prob = min(0.12, through * 2.5) * queue_factor
+                if crowded_outcome is not None:
+                    if q.outcome == crowded_outcome:
+                        prob *= TREND_FLOW_STARVE
+                    else:
+                        prob *= TREND_FLOW_CROWD
+                if rng_queue.random() >= prob:
+                    continue
+                sell_size = min(q.size, side_size)
+                if sell_size <= 0:
+                    continue
+                pos.apply_fill(
+                    q.outcome, "SELL", q.price, sell_size,
+                    market.fee_for(q.price, sell_size),
+                )
+                unwound += float(sell_size)
+                fills += 1
+                if detector is not None:
+                    detector.on_fill(q.outcome, "SELL", sell_size, now)
+                # Adverse selection зеркален: продали YES информированному
+                # покупателю — спот идёт вверх, против нас.
+                if rng_tox.random() < toxicity:
+                    shock = abs(rng_tox.gauss(0, 1)) * sigma * math.sqrt(1.0 / SECONDS_PER_YEAR)
+                    spot *= math.exp(shock * 8 if q.outcome == "YES" else -shock * 8)
+                continue
+
             if side_size + q.size > float(SimRisk.max_position_per_side):
                 continue
-            if abs(pos.net) >= float(SimRisk.max_net_exposure):
+            if abs(pos.net) >= net_cap:
                 # Разрешаем только сокращающую сторону.
                 reduces = (q.outcome == "NO" and pos.net > 0) or (
                     q.outcome == "YES" and pos.net < 0
@@ -324,6 +381,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         # Доля купленных shares, закончивших в полной паре (обе ноги пары).
         "pair_rate": (2.0 * pairs_done / total_bought) if total_bought > 0 else 0.0,
         "trending": trending,
+        "unwound": unwound,
         # Сколько секунд окна детектор провёл в каждом состоянии — чтобы
         # видеть, что реакция вообще включалась, а не победила вхолостую.
         "regime_trending_s": regime_seconds[Regime.TRENDING],
@@ -333,14 +391,24 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     }
 
 
-def run_level(args, toxicity: float, use_regime: bool | None = None) -> list[dict]:
+def run_level(
+    args,
+    toxicity: float,
+    use_regime: bool | None = None,
+    use_unwind: bool | None = None,
+    max_net: float | None = None,
+) -> list[dict]:
     """Прогнать один уровень toxicity на seed'ах 0..runs-1."""
     if use_regime is None:
         use_regime = args.regime
+    if use_unwind is None:
+        use_unwind = not args.no_unwind
+    if max_net is None:
+        max_net = args.max_net
     tasks = [
         (args.window, args.sigma, args.noise, args.spread, seed,
          toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas),
-         args.trend_prob, args.trend_strength, use_regime)
+         args.trend_prob, args.trend_strength, use_regime, use_unwind, max_net)
         for seed in range(args.runs)
     ]
     if args.jobs > 1:
@@ -357,8 +425,10 @@ def group_stats(results: list[dict]) -> str:
     mean, half = mean_ci(pnls)
     pair_rate = statistics.mean(r["pair_rate"] for r in results)
     residual = statistics.mean(r["abs_residual"] for r in results)
+    unwound = statistics.mean(r.get("unwound", 0.0) for r in results)
     return (f"PnL {mean:+7.2f} ± {half:.2f} | пар {pair_rate:5.1%} | "
-            f"|остаток| {residual:5.1f} | окон {len(results)}")
+            f"|остаток| {residual:5.1f} | разгружено {unwound:5.1f} | "
+            f"окон {len(results)}")
 
 
 def print_trend_split(results: list[dict]) -> None:
@@ -430,6 +500,107 @@ def run_sweep(args, levels: list[float]) -> None:
     print("-" * 62)
     print("Неразличимая разность означает: на этом числе прогонов эффект")
     print("уровня не отделяется от шума. Это свойство данных, а не ошибка.")
+
+
+def print_paired_by_group(base: list[dict], variant: list[dict]) -> dict:
+    """Парные разности вариант-база по группам окон. Возвращает Δ по группам."""
+    diffs: dict[str, tuple[float, float]] = {}
+    for name, selector in (("спокойные", False), ("трендовые", True), ("все", None)):
+        idx = [
+            i for i, r in enumerate(base)
+            if selector is None or r["trending"] == selector
+        ]
+        if not idx:
+            continue
+        off = [base[i]["pnl"] for i in idx]
+        on = [variant[i]["pnl"] for i in idx]
+        mean_off, _ = mean_ci(off)
+        mean_on, _ = mean_ci(on)
+        diff, half = paired_diff_ci(off, on)
+        verdict = "неразличимо" if abs(diff) <= half else (
+            "лучше" if diff > 0 else "ХУЖЕ"
+        )
+        print(f"{name:>9} ({len(idx):4d} окон): база {mean_off:+7.2f}, "
+              f"вариант {mean_on:+7.2f}, Δ {diff:+6.2f} ± {half:.2f} ({verdict})")
+        diffs[name] = (diff, half)
+    return diffs
+
+
+def run_unwind_compare(args) -> None:
+    """
+    Разгрузка ВЫКЛ (прежний симулятор) против ВКЛ (паритет с движком) на
+    общих seed'ах. Отвечает на вопрос, насколько прежняя оценка урона
+    тренда была завышена артефактом модели.
+    """
+    print(f"Сравнение разгрузки перекоса: {args.runs} прогонов, toxicity "
+          f"{args.toxicity}, тренд {args.trend_prob}/{args.trend_strength}σ")
+    print("-" * 62)
+    base = run_level(args, args.toxicity, use_unwind=False)
+    variant = run_level(args, args.toxicity, use_unwind=True)
+
+    for name, results in (("без разгрузки", base), ("с разгрузкой", variant)):
+        trend = [r for r in results if r["trending"]]
+        calm = [r for r in results if not r["trending"]]
+        print(f"{name}:")
+        print(f"  спокойные : {group_stats(calm)}")
+        print(f"  трендовые : {group_stats(trend)}")
+    print("-" * 62)
+    print("Парные разности (с разгрузкой − без):")
+    print_paired_by_group(base, variant)
+
+
+def run_net_sweep(args, caps: list[float]) -> None:
+    """
+    Свип RISK_MAX_NET_EXPOSURE на общих seed'ах: цена защиты в трендовых
+    окнах, выраженная в обороте и PnL спокойных. Порог разгрузки едет
+    вместе с лимитом: min(directional_max_net, лимит) — как требует
+    кросс-валидация конфига реального бота.
+    """
+    print(f"Свип RISK_MAX_NET_EXPOSURE {caps}: {args.runs} прогонов, toxicity "
+          f"{args.toxicity}, тренд {args.trend_prob}/{args.trend_strength}σ, "
+          f"общие seed'ы")
+    print("-" * 78)
+
+    per_cap: dict[float, list[dict]] = {}
+    for cap in caps:
+        per_cap[cap] = run_level(args, args.toxicity, max_net=cap)
+
+    print(f"{'лимит':>6} | {'все окна':^18} | {'спокойные':^18} | "
+          f"{'трендовые':^18} | {'смерж.':>6} | {'разгр.':>6}")
+    for cap in caps:
+        results = per_cap[cap]
+        calm = [r["pnl"] for r in results if not r["trending"]]
+        trend = [r["pnl"] for r in results if r["trending"]]
+        alls = [r["pnl"] for r in results]
+        m_a, h_a = mean_ci(alls)
+        m_c, h_c = mean_ci(calm)
+        m_t, h_t = mean_ci(trend)
+        merged = statistics.mean(r["merged"] for r in results if not r["trending"])
+        unwound = statistics.mean(r["unwound"] for r in results)
+        print(f"{cap:6.0f} | {m_a:+7.2f} ± {h_a:5.2f} | {m_c:+7.2f} ± {h_c:5.2f} | "
+              f"{m_t:+7.2f} ± {h_t:5.2f} | {merged:6.1f} | {unwound:6.1f}")
+
+    baseline = 120.0 if 120.0 in per_cap else caps[len(caps) // 2]
+    print("-" * 78)
+    print(f"Парные разности против лимита {baseline:.0f} (Δ = вариант − база):")
+    for cap in caps:
+        if cap == baseline:
+            continue
+        print(f"лимит {cap:.0f}:")
+        print_paired_by_group(per_cap[baseline], per_cap[cap])
+    print("-" * 78)
+
+    means = {cap: mean_ci([r["pnl"] for r in per_cap[cap]])[0] for cap in caps}
+    best = max(means, key=means.get)
+    ordered = [means[c] for c in caps]
+    monotone_up = all(a <= b for a, b in zip(ordered, ordered[1:]))
+    monotone_down = all(a >= b for a, b in zip(ordered, ordered[1:]))
+    if monotone_up or monotone_down:
+        print(f"Суммарный PnL монотонен по лимиту ({'растёт' if monotone_up else 'падает'}); "
+              f"внутреннего оптимума в этой сетке нет.")
+    else:
+        print(f"Максимум суммарного PnL в сетке — лимит {best:.0f} "
+              f"({means[best]:+.2f}); значимость смотри по парным разностям выше.")
 
 
 def run_regime_compare(args) -> None:
@@ -519,6 +690,18 @@ def main() -> None:
     ap.add_argument("--regime-compare", action="store_true",
                     help="прогнать реакцию ВЫКЛ против ВКЛ на общих seed'ах "
                          "с парным сравнением по трендовым/спокойным окнам")
+    ap.add_argument("--no-unwind", action="store_true",
+                    help="выключить разгрузку перекоса (прежнее поведение "
+                         "симулятора, БЕЗ паритета с движком)")
+    ap.add_argument("--max-net", type=float, default=120.0,
+                    help="RISK_MAX_NET_EXPOSURE; порог разгрузки едет вместе "
+                         "с ним: min(directional_max_net, лимит)")
+    ap.add_argument("--unwind-compare", action="store_true",
+                    help="разгрузка ВЫКЛ против ВКЛ на общих seed'ах: "
+                         "насколько прежняя оценка урона тренда была завышена")
+    ap.add_argument("--net-sweep", type=str, default=None,
+                    help="свип RISK_MAX_NET_EXPOSURE через запятую "
+                         "(например 30,60,90,120,180) на общих seed'ах")
     ap.add_argument("--sweep", type=str, default=None,
                     help="уровни toxicity через запятую (например 0.2,0.35,0.5,0.65): "
                          "прогнать все на общих seed'ах и сравнить парно")
@@ -530,6 +713,17 @@ def main() -> None:
 
     if args.regime_compare:
         run_regime_compare(args)
+        return
+
+    if args.unwind_compare:
+        run_unwind_compare(args)
+        return
+
+    if args.net_sweep:
+        caps = [float(x) for x in args.net_sweep.split(",") if x.strip()]
+        if len(caps) < 2:
+            raise SystemExit("--net-sweep требует минимум два значения")
+        run_net_sweep(args, caps)
         return
 
     if args.sweep:
