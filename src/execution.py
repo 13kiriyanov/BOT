@@ -455,7 +455,9 @@ class OrderManager:
         while not self._stop.is_set():
             try:
                 log.info("Подключаюсь к user stream")
-                async with self.client.subscribe(UserSpec()) as stream:
+                # subscribe() — корутина: сначала await (получаем
+                # SubscriptionHandle), и только он — async context manager.
+                async with await self.client.subscribe(UserSpec()) as stream:
                     backoff = 1.0
                     async for event in stream:
                         if self._stop.is_set():

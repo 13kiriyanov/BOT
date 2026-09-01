@@ -180,6 +180,39 @@ def test_balance_allowance_is_base_units_not_usdc():
     assert D(b.balance) / POSITION_DECIMALS == D("500")
 
 
+# ------------------------------------------------------- subscribe(spec)
+
+
+def test_subscribe_is_a_coroutine_returning_handle():
+    """
+    price_feed.run_polymarket / orderbook.run / execution.run_user_stream:
+    subscribe() — КОРУТИНА (async def), а не фабрика контекст-менеджера.
+    `async with client.subscribe(...)` без await падает с «coroutine object
+    does not support the asynchronous context manager protocol» — все три
+    стрима умерли бы на старте. Правильная форма:
+
+        async with await client.subscribe(spec) as stream:
+            async for event in stream: ...
+
+    Возвращаемый SubscriptionHandle — сам себе async-CM и async-итератор.
+    Если канарейка упала после обновления SDK, перепроверь форму вызова
+    во всех трёх модулях руками.
+    """
+    import inspect
+
+    from polymarket import AsyncSecureClient
+    from polymarket._internal.streams.handle import SubscriptionHandle
+
+    assert inspect.iscoroutinefunction(AsyncSecureClient.subscribe)
+    for attr in ("__aenter__", "__aexit__", "__aiter__", "__anext__", "close"):
+        assert hasattr(SubscriptionHandle, attr), attr
+
+    # Пагинаторы, наоборот, НЕ корутины: их зовут без await и сразу
+    # итерируют. Перепутать эти две формы — симметричный способ сломаться.
+    for name in ("list_positions", "list_open_orders", "list_series", "list_events"):
+        assert not inspect.iscoroutinefunction(getattr(AsyncSecureClient, name)), name
+
+
 # ----------------------------------------------- user-stream: событие trade
 
 

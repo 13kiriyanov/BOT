@@ -63,7 +63,9 @@ side/price/size — его; наша мейкерская нога лежит в
 `client.*` с числами закреплён канарейкой в `tests/test_units.py`; если
 после обновления SDK канарейка упала (включая ImportError на приватном
 пути) — перепроверь единицы руками, а не чини тест до зелёного.
-Новый вызов `client.*` с числом = строка здесь + канарейка там.
+Новый вызов `client.*` с числом = строка здесь + канарейка там. Форма
+вызова — тоже контракт: корутину без await не поймает ни один тест на
+заглушке, чья форма отличается от SDK (см. `tests/test_streams.py`).
 
 | Вызов | Единицы | Канарейка |
 |---|---|---|
@@ -74,6 +76,7 @@ side/price/size — его; наша мейкерская нога лежит в
 | `list_open_orders()` → price, sizes | человеческие | `test_open_order_model_returns_human_units` |
 | `get_balance_allowance()` → balance | БАЗОВЫЕ единицы (int) | `test_balance_allowance_is_base_units_not_usdc` |
 | user-stream trade → price/size | человеческие; верхний уровень — тейкер, наша нога в maker_orders | `test_user_trade_payload_units_and_maker_shape` |
+| `subscribe(spec)` | КОРУТИНА: `async with await client.subscribe(...)`; без await все стримы мертвы | `test_subscribe_is_a_coroutine_returning_handle` |
 
 ## Карта модулей
 
