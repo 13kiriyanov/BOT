@@ -171,7 +171,10 @@ class OrderBookManager:
             self._resubscribe.clear()
             try:
                 log.info("Подписка на стаканы: %d токенов", len(tokens))
-                async with client.subscribe(MarketSpec(token_ids=tokens)) as stream:
+                # subscribe() — корутина: await возвращает handle-CM.
+                async with await client.subscribe(
+                    MarketSpec(token_ids=tokens)
+                ) as stream:
                     backoff = 1.0
                     resub = asyncio.create_task(self._resubscribe.wait())
                     stream_iter = stream.__aiter__()

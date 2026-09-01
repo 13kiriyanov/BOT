@@ -103,7 +103,8 @@ class SpotFeed:
         while not self._stop.is_set():
             try:
                 log.info("Подключаюсь к Polymarket crypto price stream")
-                async with client.subscribe(spec) as stream:
+                # subscribe() — корутина: await возвращает handle-CM.
+                async with await client.subscribe(spec) as stream:
                     backoff = 1.0
                     async for event in stream:
                         if self._stop.is_set():
