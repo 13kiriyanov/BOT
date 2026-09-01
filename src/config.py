@@ -63,12 +63,12 @@ class StrategySettings(BaseSettings):
     )
 
     # --- Выбор рынков -------------------------------------------------------
-    # Слаги серий Polymarket для краткосрочных Up/Down рынков.
-    # Проверь актуальные на сайте: обычно это часовые/15-минутные серии.
-    series_slugs: list[str] = Field(
-        default_factory=lambda: ["bitcoin-up-or-down", "ethereum-up-or-down"]
-    )
-    # Резервный поиск по заголовку, если серия не найдена.
+    # ОСНОВНОЙ путь поиска — полнотекстовый title_search по ключевым словам:
+    # на живом API он находит updown-рынки (btc-updown-5m-*, *-15m-*), а
+    # запросы по слагам серий стабильно возвращают ноль. Слаги серий — только
+    # РЕЗЕРВ на случай, если поиск по заголовку не дал ничего; пустой список
+    # (дефолт) отключает резерв без предупреждений в логе.
+    series_slugs: list[str] = Field(default_factory=list)
     title_keywords: list[str] = Field(
         default_factory=lambda: ["Bitcoin Up or Down", "Ethereum Up or Down"]
     )
@@ -185,6 +185,26 @@ class StrategySettings(BaseSettings):
     # Минимальное удержание TRENDING: реакция сама душит поток филлов,
     # по которому тренд обнаружен, и без удержания детектор осциллирует.
     regime_min_hold_s: float = 45.0
+    # Прогрев вол-сигнала ПО ВРЕМЕНИ (сек), в дополнение к минимуму сэмплов.
+    # Живой фид даёт 5-20 тиков/с: счётчик сэмплов набирается за полминуты,
+    # когда медленная EWMA ещё прибита к первым тикам, — отношение fast/slow
+    # завышено и бот глохнет в ложном VOLATILE прямо на старте. До истечения
+    # прогрева вол-сигнал НЕДОСТУПЕН (режим по нему не назначается вовсе).
+    # Дефолт = полупериод медленной EWMA (300 с): остаточный вес первых
+    # сэмплов <= 50%, завышение ограничено sqrt(2) < порога входа 1.8.
+    regime_vol_min_elapsed_s: float = 300.0
+
+    # --- Валидность страйка --------------------------------------------------
+    # Сторож расхождения модели с рынком. Если |model - mid| держится выше
+    # порога дольше окна, страйк признаётся невалидным: модель для рынка
+    # отключается (чистый MM по рынку), а не клипается вокруг смещённого
+    # центра — клип оставляет fair сдвинутым на max_model_deviation и
+    # разъезжает котировки так, что обе ноги никогда не исполняются.
+    strike_divergence_threshold: Decimal = Decimal("0.25")
+    strike_divergence_hold_s: float = 8.0
+    # Диагностика сломанного fair value: если сумма двух бидов ушла ниже
+    # target_pair_cost больше, чем на этот зазор, — WARNING в лог.
+    pair_sum_warn_gap: Decimal = Decimal("0.05")
 
     # --- Восстановление после рестарта --------------------------------------
     # Читать открытые позиции с биржи при старте. Выключать это значит
@@ -299,6 +319,20 @@ class Settings:
             raise ValueError("Пороги односторонности: exit <= soft <= enter (гистерезис)")
         if s.regime_vol_ratio_exit >= s.regime_vol_ratio_enter:
             raise ValueError("REGIME_VOL_RATIO: порог выхода должен быть ниже порога входа")
+        if s.regime_vol_min_elapsed_s < 0:
+            raise ValueError("STRAT_REGIME_VOL_MIN_ELAPSED_S не может быть отрицательным")
+        if not (Decimal("0") < s.strike_divergence_threshold <= Decimal("0.9")):
+            raise ValueError("STRAT_STRIKE_DIVERGENCE_THRESHOLD вне диапазона (0, 0.9]")
+        if s.strike_divergence_threshold <= s.max_model_deviation:
+            raise ValueError(
+                "STRAT_STRIKE_DIVERGENCE_THRESHOLD должен быть выше "
+                "STRAT_MAX_MODEL_DEVIATION: иначе сторож срабатывает на "
+                "расхождении, которое клип и так считает рабочим"
+            )
+        if s.strike_divergence_hold_s <= 0:
+            raise ValueError("STRAT_STRIKE_DIVERGENCE_HOLD_S должен быть > 0")
+        if not (Decimal("0") <= s.pair_sum_warn_gap < s.target_pair_cost):
+            raise ValueError("STRAT_PAIR_SUM_WARN_GAP вне разумного диапазона")
 
 
 def load_settings() -> Settings:

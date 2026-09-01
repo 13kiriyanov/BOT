@@ -28,9 +28,29 @@ from .fair_value import VolatilityEstimator
 
 log = logging.getLogger("polybot.price")
 
-# Символы Polymarket RTDS -> внутреннее имя актива.
-POLY_SYMBOLS = {"BTCUSDT": "BTC", "ETHUSDT": "ETH"}
+# Символы Polymarket RTDS -> внутреннее имя актива. Ключи — НОРМАЛИЗОВАННАЯ
+# форма (upper, без разделителей): формат символа по проводу не зафиксирован
+# документацией SDK, а клиентский фильтр подписки сравнивает строки ТОЧНО
+# (см. normalize_rtds_symbol ниже). Допускаем и USDT- (топик binance), и
+# USD-пары (chainlink-стиль) — коллизий между ними нет.
+POLY_SYMBOLS = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "BTCUSD": "BTC", "ETHUSD": "ETH"}
 BINANCE_STREAMS = {"btcusdt@bookTicker": "BTC", "ethusdt@bookTicker": "ETH"}
+
+
+def normalize_rtds_symbol(symbol: str) -> str:
+    """
+    Привести символ RTDS к канонической форме: upper, без '/', '-', '_'.
+
+    Зачем: SDK фильтрует события по symbols НА КЛИЕНТЕ точным сравнением
+    строк, без нормализации регистра (в отличие от equity-фильтра, где есть
+    .lower()). Подписка с symbols=["BTCUSDT"] при wire-символе "btcusdt"
+    устанавливается без ошибок, но КАЖДОЕ событие молча отбрасывается ещё в
+    SDK — ingest() не вызывается ни разу, бот блокирует все рынки по
+    «спот-фид протух». Поэтому мы подписываемся на весь топик (symbols не
+    передаём) и фильтруем сами, толерантно к регистру и разделителям.
+    Канарейка: test_crypto_prices_payload_shape_and_filter_contract.
+    """
+    return symbol.replace("/", "").replace("-", "").replace("_", "").upper()
 
 
 class SpotFeed:
@@ -96,10 +116,14 @@ class SpotFeed:
 
     async def run_polymarket(self, client: AsyncSecureClient) -> None:
         """Подписка на встроенный крипто-фид Polymarket с авто-переподключением."""
-        spec = CryptoPricesSpec(
-            topic="prices.crypto.binance", symbols=list(POLY_SYMBOLS.keys())
-        )
+        # БЕЗ symbols: клиентский фильтр SDK сравнивает символы точно, и
+        # несовпадение формата (регистр/разделитель) молча убивает весь фид.
+        # Весь топик — это десятки пар с частотой цен, фильтрация на нашей
+        # стороне дешёвая. См. normalize_rtds_symbol.
+        spec = CryptoPricesSpec(topic="prices.crypto.binance")
         backoff = 1.0
+        first_tick_logged = False
+        unmatched_seen: set[str] = set()
         while not self._stop.is_set():
             try:
                 log.info("Подключаюсь к Polymarket crypto price stream")
@@ -116,9 +140,20 @@ class SpotFeed:
                         value = getattr(payload, "value", None)
                         if symbol is None or value is None:
                             continue
-                        asset = POLY_SYMBOLS.get(str(symbol).upper())
+                        if not first_tick_logged:
+                            # Живое доказательство формата символа по проводу.
+                            first_tick_logged = True
+                            log.info(
+                                "Крипто-фид жив: первый тик symbol=%r value=%s",
+                                symbol, value,
+                            )
+                        norm = normalize_rtds_symbol(str(symbol))
+                        asset = POLY_SYMBOLS.get(norm)
                         if asset:
                             self.ingest(asset, float(value))
+                        elif norm not in unmatched_seen:
+                            unmatched_seen.add(norm)
+                            log.debug("Крипто-фид: чужой символ %r — пропускаю", symbol)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - фид не должен ронять бота

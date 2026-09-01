@@ -73,13 +73,18 @@ def gamma_series(events: list[Event], **over) -> Series:
     return series.model_copy(update={"events": tuple(events)})
 
 
-def paginate(items: list, page_size: int = 1) -> AsyncPaginator:
+def paginate(
+    items: list, page_size: int = 1, fetch_log: list | None = None
+) -> AsyncPaginator:
     """
     НАСТОЯЩИЙ пагинатор SDK поверх Page, по одному элементу на страницу:
     и забытый .iter_items(), и чтение только первой страницы — провал.
+    fetch_log считает обращения к API — им проверяется ранняя остановка.
     """
 
     async def fetch(cursor: str | None) -> Page:
+        if fetch_log is not None:
+            fetch_log.append(cursor)
         idx = int(cursor or 0)
         has_more = idx + page_size < len(items)
         return Page(
@@ -107,6 +112,7 @@ class FakeGammaClient:
         self._events_error = events_error
         self.series_queries: list[str] = []
         self.event_queries: list[str] = []
+        self.event_fetches: list = []      # обращения к страницам list_events
 
     def list_series(
         self, *, slug: str | None = None, closed: bool, page_size: int
@@ -124,7 +130,7 @@ class FakeGammaClient:
         self.event_queries.append(title_search)
         if self._events_error is not None:
             raise self._events_error
-        return paginate(self._events)
+        return paginate(self._events, fetch_log=self.event_fetches)
 
 
 def make_discovery(client: FakeGammaClient, **over) -> MarketDiscovery:
@@ -144,10 +150,13 @@ def find(disc: MarketDiscovery, spots: dict[str, float] | None = None):
 # ------------------------------------------------------------------- поиск
 
 
-def test_series_path_extracts_markets_through_pages():
-    """ГЛАВНЫЙ тест бага: рынок доезжает из series -> event -> target."""
-    series = gamma_series([gamma_event([market_dict(1)])])
-    client = FakeGammaClient(series={"bitcoin-up-or-down": [series]})
+def test_search_is_primary_and_extracts_markets_through_pages():
+    """
+    ГЛАВНЫЙ путь — title_search (на живом API только он находит updown-
+    рынки): рынок доезжает из event -> target, серии не опрашиваются вовсе.
+    """
+    ev = gamma_event([market_dict(1)])
+    client = FakeGammaClient(series={}, events=[ev])
     disc = make_discovery(client)
 
     found = find(disc)
@@ -157,24 +166,68 @@ def test_series_path_extracts_markets_through_pages():
     assert (t.yes_token_id, t.no_token_id) == ("111", "122")
     assert t.asset == "BTC"
     assert 250 <= t.seconds_left <= 300
-    assert disc.last_funnel.series_events == 1
+    assert client.event_queries == ["Bitcoin Up or Down"]
+    assert client.series_queries == []          # резерв не понадобился
+    assert disc.last_funnel.search_events == 1
+    assert disc.last_funnel.series_events == 0
     assert disc.last_funnel.accepted == 1
-    # Поиск по заголовку не понадобился.
-    assert client.event_queries == []
 
 
-def test_search_fallback_extracts_markets_through_pages():
-    """Серии пусты -> резервный полнотекстовый путь, тоже постранично."""
-    ev = gamma_event([market_dict(2)])
-    client = FakeGammaClient(series={}, events=[ev])
+def test_series_are_fallback_when_search_is_empty():
+    """Поиск пуст -> резервный путь через серии, тоже постранично."""
+    series = gamma_series([gamma_event([market_dict(2)])])
+    client = FakeGammaClient(series={"bitcoin-up-or-down": [series]}, events=[])
     disc = make_discovery(client)
 
     found = find(disc)
 
     assert len(found) == 1
+    # Сначала спросили поиск (по каждому ключу), потом серии.
     assert client.event_queries == ["Bitcoin Up or Down"]
-    assert disc.last_funnel.series_events == 0
-    assert disc.last_funnel.search_events == 1
+    assert client.series_queries == ["bitcoin-up-or-down", "ethereum-up-or-down"]
+    assert disc.last_funnel.search_events == 0
+    assert disc.last_funnel.series_events == 1
+
+
+def test_empty_series_slugs_skip_fallback_silently(caplog):
+    """Пустые series_slugs (дефолт) — ни запросов, ни WARNING про серии."""
+    client = FakeGammaClient(series={}, events=[])
+    disc = make_discovery(client, series_slugs=[])
+
+    with caplog.at_level(logging.WARNING, logger="polybot.discovery"):
+        found = find(disc)
+
+    assert found == []
+    assert client.series_queries == []
+    assert not any("Серия" in r.message for r in caplog.records)
+    # Итоговое предупреждение о пустом результате — есть, и без серий.
+    summary = [r.message for r in caplog.records if "не найдено" in r.message]
+    assert summary and "серии" not in summary[0]
+
+
+def test_search_stops_early_by_end_date():
+    """
+    Выборка поиска отсортирована по endDate: событие за горизонтом окна
+    обрывает пагинацию. Без этого бот сливал ~900 событий каждый цикл.
+    """
+    near1 = gamma_event([market_dict(1)], id="1", endDate=iso_in(300))
+    near2 = gamma_event([market_dict(2, endDate=iso_in(400))], id="2",
+                        endDate=iso_in(400))
+    far = [
+        gamma_event([market_dict(3 + i, endDate=iso_in(7200))], id=str(3 + i),
+                    endDate=iso_in(7200 + i))
+        for i in range(4)
+    ]
+    client = FakeGammaClient(events=[near1, near2, *far])
+    disc = make_discovery(client, title_keywords=["Bitcoin Up or Down"])
+
+    found = find(disc)
+
+    # Два близких события взяты, дальняя часть выборки не выкачивалась:
+    # три обращения к API (near1, near2, первое дальнее — на нём стоп).
+    assert disc.last_funnel.search_events == 2
+    assert len(client.event_fetches) == 3
+    assert len(found) == 2
 
 
 def test_multipage_series_are_not_truncated():
@@ -257,10 +310,13 @@ def test_max_markets_overflow_is_counted_not_silent():
 # ------------------------------------------------------------------- логи
 
 
-def test_series_api_error_warns_and_falls_back_to_search(caplog):
-    """Сломанный поиск обязан кричать WARNING, а не шептать debug."""
-    ev = gamma_event([market_dict(3)])
-    client = FakeGammaClient(series_error=RuntimeError("HTTP 500"), events=[ev])
+def test_search_api_error_warns_and_falls_back_to_series(caplog):
+    """Сломанный поиск обязан кричать WARNING, а резерв через серии — спасать."""
+    series = gamma_series([gamma_event([market_dict(3)])])
+    client = FakeGammaClient(
+        series={"bitcoin-up-or-down": [series]},
+        events_error=RuntimeError("HTTP 500"),
+    )
     disc = make_discovery(client)
 
     with caplog.at_level(logging.WARNING, logger="polybot.discovery"):
@@ -268,7 +324,22 @@ def test_series_api_error_warns_and_falls_back_to_search(caplog):
 
     assert len(found) == 1  # резервный путь спас
     warned = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("недоступна" in m and "HTTP 500" in m for m in warned)
+    assert any("Поиск по заголовку" in m and "HTTP 500" in m for m in warned)
+
+
+def test_series_api_error_warns(caplog):
+    """И сломанный резерв тоже кричит WARNING, а не шепчет debug."""
+    client = FakeGammaClient(series_error=RuntimeError("HTTP 502"), events=[])
+    disc = make_discovery(client)
+
+    with caplog.at_level(logging.WARNING, logger="polybot.discovery"):
+        found = find(disc)
+
+    assert found == []
+    assert any(
+        "недоступна" in r.message and "HTTP 502" in r.message
+        for r in caplog.records if r.levelno == logging.WARNING
+    )
 
 
 def test_stale_slug_warns_even_without_exception(caplog):
@@ -304,6 +375,19 @@ def test_search_api_error_warns(caplog):
 # ------------------------------------------------------------------ diag.py
 
 
+def _fake_public(monkeypatch, fake: FakeGammaClient) -> None:
+    import diag
+
+    class FakePublicClient:
+        async def __aenter__(self):
+            return fake
+
+        async def __aexit__(self, *exc) -> None:
+            return None
+
+    monkeypatch.setattr(diag, "AsyncPublicClient", FakePublicClient)
+
+
 def test_diag_smoke_offline(monkeypatch, capsys):
     """
     diag.py на том же фейке: скрипт проходит все разделы без сети, печатает
@@ -314,17 +398,10 @@ def test_diag_smoke_offline(monkeypatch, capsys):
 
     import diag
 
-    series = gamma_series([gamma_event([market_dict(1)])])
-    fake = FakeGammaClient(series={"bitcoin-up-or-down": [series]})
-
-    class FakePublicClient:
-        async def __aenter__(self):
-            return fake
-
-        async def __aexit__(self, *exc) -> None:
-            return None
-
-    monkeypatch.setattr(diag, "AsyncPublicClient", FakePublicClient)
+    fake = FakeGammaClient(
+        series={}, events=[gamma_event([market_dict(1, slug="btc-updown-5m-1788276000")])]
+    )
+    _fake_public(monkeypatch, fake)
 
     code = asyncio.run(diag.run(argparse.Namespace(max_series=50, horizon_hours=24.0)))
     out = capsys.readouterr().out
@@ -335,12 +412,11 @@ def test_diag_smoke_offline(monkeypatch, capsys):
     assert "enable_order_book: да" in out
     assert "БОТ ВЗЯЛ БЫ" in out
     assert "воронка" in out
-    # Скан серий нашёл слаг по маркеру.
-    assert "bitcoin-up-or-down" in out
+    assert "btc-updown-5m-1788276000" in out
 
 
 def test_diag_exit_code_2_when_bot_settings_find_nothing(monkeypatch, capsys):
-    """Рынки на бирже есть, но слаг бота другой — diag говорит именно это."""
+    """Рынки на бирже есть (в TWAP-серии), но поиск бота их не видит."""
     import argparse
 
     import diag
@@ -350,16 +426,8 @@ def test_diag_exit_code_2_when_bot_settings_find_nothing(monkeypatch, capsys):
                      title="Bitcoin Up or Down TWAP")],
         slug="bitcoin-up-or-down-twap", title="Bitcoin Up or Down TWAP",
     )
-    fake = FakeGammaClient(series={"bitcoin-up-or-down-twap": [series]})
-
-    class FakePublicClient:
-        async def __aenter__(self):
-            return fake
-
-        async def __aexit__(self, *exc) -> None:
-            return None
-
-    monkeypatch.setattr(diag, "AsyncPublicClient", FakePublicClient)
+    fake = FakeGammaClient(series={"bitcoin-up-or-down-twap": [series]}, events=[])
+    _fake_public(monkeypatch, fake)
 
     code = asyncio.run(diag.run(argparse.Namespace(max_series=50, horizon_hours=24.0)))
     out = capsys.readouterr().out
@@ -367,4 +435,22 @@ def test_diag_exit_code_2_when_bot_settings_find_nothing(monkeypatch, capsys):
     assert code == 2
     # Скан по маркерам актуальный слаг всё равно нашёл и показал.
     assert "bitcoin-up-or-down-twap" in out
-    assert "СЕРИИ" in out.upper() or "слаги" in out.lower()
+    assert "слаги" in out.lower()
+
+
+def test_slug_start_ts_parsing():
+    """Хвост слага btc-updown-5m-<ts> — unix-время начала окна."""
+    from src.discovery import parse_slug_start_ts
+
+    assert parse_slug_start_ts("btc-updown-5m-1788276000") == 1788276000.0
+    assert parse_slug_start_ts("eth-updown-15m-1788277500") == 1788277500.0
+    assert parse_slug_start_ts("bitcoin-up-or-down-3pm-et") is None
+    assert parse_slug_start_ts("market-1234") is None          # не unix-время
+    assert parse_slug_start_ts("") is None
+
+    # И конец цепочки: рынок из поиска несёт start_ts в TargetMarket.
+    ev = gamma_event([market_dict(1, slug="btc-updown-5m-1788276000")])
+    client = FakeGammaClient(events=[ev])
+    disc = make_discovery(client)
+    found = find(disc)
+    assert found and found[0].start_ts == 1788276000.0

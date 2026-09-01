@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
 from .models import (
@@ -69,6 +70,8 @@ class QuoteGenerator:
     def __init__(self, strat_cfg, risk_cfg) -> None:  # noqa: ANN001
         self.s = strat_cfg
         self.r = risk_cfg
+        # Антиспам диагностики «сумма пары ниже цели»: slug -> monotonic ts.
+        self._pair_sum_warned: dict[str, float] = {}
 
     # ------------------------------------------------- резервная цена
 
@@ -297,6 +300,26 @@ class QuoteGenerator:
             pair_cost = yes_price + no_price + market.fee_per_pair(yes_price, no_price)
             if pair_cost >= cap:
                 return quotes
+
+        # ДИАГНОСТИКА СЛОМАННОГО FAIR VALUE. Инвариант ограничивает сумму
+        # пары СВЕРХУ (max_pair_cost), но сумма сильно НИЖЕ цели — тоже
+        # авария: так бывает, когда fair съехал от рынка (ложный страйк,
+        # клип модели) и каждую ногу зажало о её стакан далеко от исполнения.
+        # Экономически такие котировки бессмысленны — обе ноги никогда не
+        # исполнятся. Инвариант формально цел, поэтому только WARNING.
+        pair_sum = yes_price + no_price
+        warn_gap = self.s.pair_sum_warn_gap
+        if warn_gap > 0 and pair_sum < self.s.target_pair_cost - warn_gap:
+            now = time.monotonic()
+            if now - self._pair_sum_warned.get(market.slug, 0.0) >= 30.0:
+                self._pair_sum_warned[market.slug] = now
+                log.warning(
+                    "[%s] Сумма пары %.3f существенно ниже цели %.3f "
+                    "(YES %.3f + NO %.3f, fair=%.4f): признак сломанного "
+                    "fair value — ноги висят там, где их не исполнят",
+                    market.slug, pair_sum, self.s.target_pair_cost,
+                    yes_price, no_price, float(fv.fair),
+                )
 
         yes_size = self._size_for(market, position, "YES", fv)
         no_size = self._size_for(market, position, "NO", fv)

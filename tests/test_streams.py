@@ -69,9 +69,11 @@ class FakeStreamClient:
         self._events = events
         self.calls = 0
         self.stopper = None
+        self.specs: list = []
 
     async def subscribe(self, spec):  # noqa: ANN001 - спец SDK
         self.calls += 1
+        self.specs.append(spec)
         if self.calls == 1:
             return FakeHandle(self._events)
         if self.stopper is not None:
@@ -114,10 +116,27 @@ def test_user_stream_consumes_events_through_sdk_shaped_subscribe():
     assert client.calls >= 2
 
 
-def test_price_feed_consumes_ticks_through_sdk_shaped_subscribe():
-    """price_feed.run_polymarket: тик спота доезжает до self.price()."""
-    events = [Obj(payload=Obj(symbol="BTCUSDT", value="100500.5"))]
-    client = FakeStreamClient(events)
+def test_price_feed_consumes_real_rtds_events_with_wire_symbols():
+    """
+    price_feed.run_polymarket: события — НАСТОЯЩИЕ модели RTDS SDK, символы
+    в форме провода (нижний регистр, вариант со слэшем) — оба тика доезжают
+    до self.price(). Прежняя заглушка со symbol="BTCUSDT" (верхний регистр)
+    прятала живой баг: точечная подписка с верхним регистром молча теряла
+    каждое событие ещё в фильтре SDK, ingest() не вызывался ни разу.
+    """
+    from polymarket.models.rtds_events import CryptoPricesBinanceEvent
+
+    ev_btc = CryptoPricesBinanceEvent.model_validate({
+        "type": "update", "timestamp": 1788276000000,
+        "payload": {"symbol": "btcusdt", "timestamp": 1788276000,
+                    "value": "100500.5"},
+    })
+    ev_eth = CryptoPricesBinanceEvent.model_validate({
+        "type": "update", "timestamp": 1788276000500,
+        "payload": {"symbol": "ETH/USDT", "timestamp": 1788276000,
+                    "value": "4200.25"},
+    })
+    client = FakeStreamClient([ev_btc, ev_eth])
     feed = SpotFeed(vol_halflife_s=45.0, momentum_halflife_s=8.0,
                     vol_floor_annual=D("0.30"))
     client.stopper = feed.stop
@@ -125,7 +144,11 @@ def test_price_feed_consumes_ticks_through_sdk_shaped_subscribe():
     asyncio.run(drive(feed.run_polymarket(client)))  # type: ignore[arg-type]
 
     assert feed.price("BTC") == 100500.5
+    assert feed.price("ETH") == 4200.25
     assert client.calls >= 2
+    # Подписка обязана быть ТОПИКОВОЙ: клиентский фильтр symbols в SDK
+    # сравнивает строки точно, и несовпадение формата молча убивает фид.
+    assert client.specs and client.specs[0].symbols is None
 
 
 def test_orderbook_consumes_snapshots_through_sdk_shaped_subscribe():

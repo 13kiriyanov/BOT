@@ -45,6 +45,25 @@ ASSET_PATTERNS = {
 }
 # Числа вида "$67,432.10" или "67432.1" в описании.
 PRICE_RE = re.compile(r"\$?\s*([0-9]{3,7}(?:,[0-9]{3})*(?:\.[0-9]+)?)")
+# Unix-время начала окна в хвосте слага: btc-updown-5m-1788276000.
+SLUG_START_TS_RE = re.compile(r"-(\d{10})$")
+# Ранняя остановка поиска по endDate: берём события, истекающие не позже
+# max_seconds + этот запас. Дальше по ascending-порядку — только позже.
+SEARCH_END_LOOKAHEAD_S = 120.0
+# Предохранитель от бесконечной выборки, если сортировка не сработала.
+SEARCH_MAX_EVENTS = 200
+
+
+def parse_slug_start_ts(slug: str) -> float | None:
+    """Достать unix-время начала окна из хвоста слага; None — его там нет."""
+    match = SLUG_START_TS_RE.search(slug or "")
+    if not match:
+        return None
+    ts = float(match.group(1))
+    # Диапазон правдоподобия: 2017..2038. Чужие десятизначные числа мимо.
+    if not (1.5e9 <= ts <= 2.2e9):
+        return None
+    return ts
 
 
 def _parse_ts(value) -> float | None:  # noqa: ANN001
@@ -131,8 +150,8 @@ class DiscoveryFunnel:
     от «поиск сломался» — а это разные аварии с разными починками.
     """
 
-    series_events: int = 0      # событий из заданных серий
-    search_events: int = 0      # событий из полнотекстового резерва
+    search_events: int = 0      # событий из полнотекстового поиска (основной)
+    series_events: int = 0      # событий из заданных серий (резерв)
     markets_in: int = 0         # рынков внутри пришедших событий
     drop_state: int = 0         # not active / closed / archived / нет state
     drop_accepting: int = 0     # accepting_orders=False
@@ -149,7 +168,7 @@ class DiscoveryFunnel:
     def describe(self) -> str:
         """Одна строка для INFO-лога discovery_loop."""
         return (
-            f"событий: серии={self.series_events} поиск={self.search_events}; "
+            f"событий: поиск={self.search_events} серии={self.series_events}; "
             f"рынков={self.markets_in}, взято={self.accepted}; отсев: "
             f"состояние={self.drop_state} приём_ордеров={self.drop_accepting} "
             f"стакан={self.drop_book} без_даты={self.drop_no_end} "
@@ -192,8 +211,46 @@ class MarketDiscovery:
 
     # ------------------------------------------------------------- поиск
 
+    async def _candidates_from_search(self) -> list:
+        """
+        ОСНОВНОЙ путь: полнотекстовый поиск по заголовкам. На живом API
+        именно он находит updown-рынки; запросы по слагам серий стабильно
+        возвращают ноль (см. _candidates_from_series — теперь это резерв).
+        """
+        events = []
+        # Выборка отсортирована по endDate по возрастанию, а торгуем мы
+        # только окно до max_seconds: всё, что истекает позже, не нужно.
+        # Без ранней остановки поиск сливал ~900 событий (десятки страниц
+        # API) каждый цикл discovery.
+        cutoff = time.time() + self.max_seconds + SEARCH_END_LOOKAHEAD_S
+        for kw in self.title_keywords:
+            try:
+                paginator = self.client.list_events(
+                    title_search=kw, closed=False, order="endDate",
+                    ascending=True, page_size=20,
+                )
+                taken = 0
+                async for ev in paginator.iter_items():
+                    end_ts = _parse_ts(
+                        getattr(getattr(ev, "schedule", None), "end_date", None)
+                    )
+                    if end_ts is not None and end_ts > cutoff:
+                        break
+                    events.append(ev)
+                    taken += 1
+                    if taken >= SEARCH_MAX_EVENTS:
+                        log.warning(
+                            "Поиск '%s': упёрся в предохранитель %d событий — "
+                            "сортировка по endDate не сработала?",
+                            kw, SEARCH_MAX_EVENTS,
+                        )
+                        break
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Поиск по заголовку '%s' не удался: %s", kw, exc)
+        return events
+
     async def _candidates_from_series(self) -> list:
-        """Основной путь: рынки из заданных серий."""
+        """Резерв: рынки из заданных серий, если поиск не дал ничего."""
         events = []
         for slug in self.series_slugs:
             try:
@@ -214,35 +271,21 @@ class MarketDiscovery:
                 log.warning("Серия '%s' недоступна: %s", slug, exc)
         return events
 
-    async def _candidates_from_search(self) -> list:
-        """Резерв: полнотекстовый поиск, если серии не отдали событий."""
-        events = []
-        for kw in self.title_keywords:
-            try:
-                paginator = self.client.list_events(
-                    title_search=kw, closed=False, order="endDate",
-                    ascending=True, page_size=20,
-                )
-                async for ev in paginator.iter_items():
-                    events.append(ev)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Поиск по заголовку '%s' не удался: %s", kw, exc)
-        return events
-
     async def find_markets(self, spot_prices: dict[str, float]) -> list[TargetMarket]:
         """Вернуть список торгуемых прямо сейчас рынков."""
         funnel = DiscoveryFunnel()
         self.last_funnel = funnel
 
-        events = await self._candidates_from_series()
-        funnel.series_events = len(events)
-        if not events:
-            events = await self._candidates_from_search()
-            funnel.search_events = len(events)
+        events = await self._candidates_from_search()
+        funnel.search_events = len(events)
+        if not events and self.series_slugs:
+            events = await self._candidates_from_series()
+            funnel.series_events = len(events)
         if not events:
             log.warning(
-                "Активных Up/Down рынков не найдено: серии %s и поиск по %s "
-                "вернули ноль событий", self.series_slugs, self.title_keywords,
+                "Активных Up/Down рынков не найдено: поиск по %s%s вернул "
+                "ноль событий", self.title_keywords,
+                f" и серии {self.series_slugs}" if self.series_slugs else "",
             )
             return []
 
@@ -325,6 +368,7 @@ class MarketDiscovery:
             yes_token_id=yes_token,
             no_token_id=no_token,
             end_ts=end_ts,
+            start_ts=parse_slug_start_ts(str(getattr(m, "slug", ""))),
             tick_size=tick,
             min_order_size=min_size,
             neg_risk=bool(getattr(state, "neg_risk", False)),
@@ -383,14 +427,15 @@ class MarketDiscovery:
     def _resolve_strike(
         self, target: TargetMarket, m, spot_prices: dict[str, float]
     ) -> Decimal | None:  # noqa: ANN001
-        """Три стратегии определения страйка, по убыванию надёжности."""
+        """Стратегии определения страйка, по убыванию надёжности."""
         cid = target.condition_id
         if cid in self._strike_cache:
             return self._strike_cache[cid]
 
         spot = spot_prices.get(target.asset)
 
-        # 1. Наблюдали открытие окна.
+        # 1. Наблюдали открытие окна (сюда же пишет движок через
+        #    observe_window_open, поймав момент start_ts на живом споте).
         if cid in self._observed_open:
             strike = self._observed_open[cid]
             log.info("[%s] Страйк из наблюдения открытия: %s", target.slug, strike)
@@ -404,27 +449,32 @@ class MarketDiscovery:
             self._strike_cache[cid] = parsed
             return parsed
 
-        # 3. Инвертируем модель по рыночной цене.
-        prices = getattr(m, "prices", None)
-        mid = None
-        if prices is not None:
-            bb = getattr(prices, "best_bid", None)
-            ba = getattr(prices, "best_ask", None)
-            if bb is not None and ba is not None:
-                mid = (float(bb) + float(ba)) / 2.0
-        if spot is not None and mid is not None:
-            # Используем консервативную вол-оценку для калибровки.
-            strike = implied_strike(spot, mid, target.seconds_left, 0.45)
-            if strike is not None:
-                log.info(
-                    "[%s] Страйк калиброван по рынку (mid=%.3f): %s",
-                    target.slug, mid, strike,
-                )
-                self._strike_cache[cid] = strike
-                return strike
-
-        log.warning("[%s] Страйк не определён — directional отключён", target.slug)
+        # 3. Инверсию модели по рыночному mid здесь НЕ делаем. Раньше она
+        #    калибровалась по prices из Gamma REST (кэшированным и легко
+        #    устаревшим) с захардкоженной сигмой 0.45 — и кэшировала ошибку
+        #    навсегда: на живом фиде модель уходила на 0.68 от рынка. Теперь
+        #    калибрует движок — отложенно, по живому стакану, свежему споту
+        #    и живой вол-оценке (см. engine._try_calibrate_strike), а сюда
+        #    результат приходит через set_strike.
+        log.debug(
+            "[%s] Страйк при discovery не определён — отложенная калибровка "
+            "по живым данным", target.slug,
+        )
         return None
+
+    # ------------------------------------------------ страйк: API движка
+
+    def set_strike(self, condition_id: str, strike: Decimal) -> None:
+        """Запомнить страйк, откалиброванный движком по живым данным."""
+        self._strike_cache[condition_id] = strike
+
+    def invalidate_strike(self, condition_id: str) -> None:
+        """
+        Сторож расхождения признал страйк ложным: забыть все его источники,
+        чтобы пересборка рынка не восстановила то же неверное значение.
+        """
+        self._strike_cache.pop(condition_id, None)
+        self._observed_open.pop(condition_id, None)
 
     def forget(self, condition_id: str) -> None:
         self._strike_cache.pop(condition_id, None)

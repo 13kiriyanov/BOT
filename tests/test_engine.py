@@ -22,7 +22,7 @@ from polymarket.pagination import AsyncPaginator, Page  # noqa: E402
 
 from src import engine as engine_mod  # noqa: E402
 from src.engine import TradingEngine  # noqa: E402
-from src.models import Fill, MarketPosition, TargetMarket  # noqa: E402
+from src.models import Book, BookLevel, Fill, MarketPosition, TargetMarket  # noqa: E402
 from src.risk import HaltReason  # noqa: E402
 
 D = Decimal
@@ -71,6 +71,10 @@ class Cfg:
         regime_vol_ratio_enter = 1.8
         regime_vol_ratio_exit = 1.35
         regime_min_hold_s = 45.0
+        regime_vol_min_elapsed_s = 300.0
+        strike_divergence_threshold = D("0.25")
+        strike_divergence_hold_s = 8.0
+        pair_sum_warn_gap = D("0.05")
 
     class risk:
         max_position_per_side = D("250")
@@ -578,3 +582,152 @@ def test_reported_fee_does_not_downgrade_known_rate():
 
     assert market.fee_rate == D("0.02")
     assert market.fee_exponent == D("1")
+
+
+# --------------------------------------------- страйк: живая калибровка
+
+
+def warm_spot(engine: TradingEngine, asset: str = "BTC",
+              price: float = 109_500.0, n: int = 40) -> float:
+    """Свежий прогретый спот: n тиков, последний — прямо сейчас."""
+    now = time.time()
+    for i in range(n):
+        engine.spot.ingest(asset, price * (1 + 1e-5 * (i % 3)), now - 4 + i * 0.1)
+    return engine.spot.price(asset)  # type: ignore[return-value]
+
+
+def live_book(bid: str, ask: str) -> Book:
+    return Book(
+        token_id="tok_yes",
+        bids=[BookLevel(D(bid), D("100"))],
+        asks=[BookLevel(D(ask), D("80"))],
+        updated_at=time.time(),
+    )
+
+
+def test_strike_observed_at_window_open_crossing():
+    """Пересечение start_ts со свежим спотом: спот сейчас и есть страйк."""
+    engine = make_engine(FakeClient())
+    spot = warm_spot(engine)
+    market = make_market(start_ts=time.time() - 1.0)
+
+    engine._try_calibrate_strike(market, None)
+
+    assert market.strike is not None
+    assert abs(float(market.strike) - spot) < 0.011  # round до цента
+
+    # Открытие, пропущенное больше допуска назад, задним числом не считается.
+    late = make_market(condition_id="0xlate", start_ts=time.time() - 30.0)
+    engine._try_calibrate_strike(late, None)   # и книги нет — implied не сможет
+    assert late.strike is None
+
+
+def test_strike_deferred_calibration_uses_live_book_and_sigma():
+    """
+    Отложенная инверсия GBM: живой mid нашего стакана + свежий спот + живая
+    сигма. При mid около 0.5 страйк обязан лечь рядом со спотом.
+    """
+    engine = make_engine(FakeClient())
+    spot = warm_spot(engine)
+    market = make_market(start_ts=time.time() - 30.0)
+
+    engine._try_calibrate_strike(market, live_book("0.50", "0.52"))
+
+    assert market.strike is not None
+    assert abs(float(market.strike) / spot - 1.0) < 0.01
+
+    # До открытия окна mid ничего не знает о будущем страйке — не калибруем.
+    pre = make_market(condition_id="0xpre", start_ts=time.time() + 60.0)
+    engine._try_calibrate_strike(pre, live_book("0.50", "0.52"))
+    assert pre.strike is None
+
+    # Экстремальный mid: наклон inv_cdf на краю огромен — не калибруем.
+    edge = make_market(condition_id="0xedge", start_ts=time.time() - 30.0)
+    engine._try_calibrate_strike(edge, live_book("0.95", "0.97"))
+    assert edge.strike is None
+
+
+def test_strike_calibration_requires_fresh_spot():
+    """Протухший или пустой спот-фид не даёт калибровать вовсе."""
+    engine = make_engine(FakeClient())
+    market = make_market(start_ts=time.time() - 30.0)
+
+    engine._try_calibrate_strike(market, live_book("0.50", "0.52"))
+    assert market.strike is None            # спота нет вовсе
+
+    # Спот есть, но старше stale_price_timeout_s (4.0 в конфиге теста).
+    stale_ts = time.time() - 30
+    for i in range(40):
+        engine.spot.ingest("BTC", 109_500.0, stale_ts - 4 + i * 0.1)
+    engine._try_calibrate_strike(market, live_book("0.50", "0.52"))
+    assert market.strike is None
+
+
+# --------------------------------------------- страйк: сторож расхождения
+
+
+class WatchdogCfg(Cfg):
+    class strategy(Cfg.strategy):
+        strike_divergence_hold_s = 0.05
+
+
+def diverged_fv() -> "engine_mod.FairValueModel":
+    from src.models import FairValue
+    return FairValue(
+        fair=D("0.43"), model_prob=D("0.96"), market_mid=D("0.28"),
+        edge=D("0.68"), sigma_annual=D("0.45"), confidence=D("1"),
+    )
+
+
+def agreeing_fv() -> "engine_mod.FairValueModel":
+    from src.models import FairValue
+    return FairValue(
+        fair=D("0.29"), model_prob=D("0.30"), market_mid=D("0.28"),
+        edge=D("0.02"), sigma_annual=D("0.45"), confidence=D("1"),
+    )
+
+
+def test_divergence_watchdog_needs_persistence():
+    """Разовый выброс не снимает страйк: таймер сбрасывается возвратом."""
+    engine = TradingEngine(WatchdogCfg())  # type: ignore[arg-type]
+    engine.client = FakeClient()  # type: ignore[assignment]
+    market = make_market(strike=D("100000"))
+    mid = D("0.28")
+
+    assert engine._check_model_divergence(market, diverged_fv(), mid, 109500.0) is False
+    assert market.strike is not None       # только взвод таймера
+    assert engine._check_model_divergence(market, agreeing_fv(), mid, 109500.0) is False
+    assert engine._strike_meta["0xcond"]["diverged_since"] is None  # сброшен
+
+
+def test_divergence_watchdog_invalidates_then_blocks(caplog):
+    """Устойчивое расхождение: инвалидация; повторное — блок до конца окна."""
+    import logging as _logging
+
+    engine = TradingEngine(WatchdogCfg())  # type: ignore[arg-type]
+    engine.client = FakeClient()  # type: ignore[assignment]
+    market = make_market(strike=D("100000"))
+    mid = D("0.28")
+
+    with caplog.at_level(_logging.WARNING, logger="polybot.engine"):
+        assert engine._check_model_divergence(market, diverged_fv(), mid, 109500.0) is False
+        time.sleep(0.06)
+        assert engine._check_model_divergence(market, diverged_fv(), mid, 109500.0) is True
+
+    assert market.strike is None
+    meta = engine._strike_meta["0xcond"]
+    assert meta["invalidations"] == 1 and not meta["blocked"]
+    assert any("страйк невалиден" in r.message for r in caplog.records)
+
+    # Повторный срыв (например, после рекалибровки) — блок до конца окна.
+    market.strike = D("100000")
+    engine._check_model_divergence(market, diverged_fv(), mid, 109500.0)
+    time.sleep(0.06)
+    assert engine._check_model_divergence(market, diverged_fv(), mid, 109500.0) is True
+    assert engine._strike_meta["0xcond"]["blocked"] is True
+
+    # Блок закрывает и рекалибровку: даже идеальные входы не вернут модель.
+    warm_spot(engine)
+    market.start_ts = time.time() - 30.0
+    engine._try_calibrate_strike(market, live_book("0.50", "0.52"))
+    assert market.strike is None
