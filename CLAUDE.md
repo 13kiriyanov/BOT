@@ -77,6 +77,7 @@ side/price/size — его; наша мейкерская нога лежит в
 | `get_balance_allowance()` → balance | БАЗОВЫЕ единицы (int) | `test_balance_allowance_is_base_units_not_usdc` |
 | user-stream trade → price/size | человеческие; верхний уровень — тейкер, наша нога в maker_orders | `test_user_trade_payload_units_and_maker_shape` |
 | `subscribe(spec)` | КОРУТИНА: `async with await client.subscribe(...)`; без await все стримы мертвы | `test_subscribe_is_a_coroutine_returning_handle` |
+| любой `list_*()` (пагинатор) | `async for` отдаёт ОБЪЕКТЫ Page; элементы — только через `.iter_items()`. Забытый iter_items не падает: getattr по Page молча даёт пустоту — «рынков/позиций/ордеров нет» | `test_paginator_iterates_pages_not_items` |
 
 ## Карта модулей
 
@@ -105,9 +106,14 @@ python simulate.py --runs 150 --toxicity 0.5
 Тесты разложены по файлам: `tests/test_strategy.py` — чистая логика
 (модель, котирование, риск, учёт); `tests/test_markout.py`,
 `tests/test_regime.py` и `tests/test_simulate.py` — тоже без SDK. `tests/test_engine.py` (движок на
-заглушке клиента), `tests/test_execution.py` (user-stream) и
-`tests/test_units.py` (канарейки единиц) требуют установленного пакета
-`polymarket`; без него они пропускаются.
+заглушке клиента), `tests/test_execution.py` (user-stream),
+`tests/test_discovery.py` (поиск рынков и diag.py на настоящем пагинаторе и
+gamma-моделях) и `tests/test_units.py` (канарейки единиц) требуют
+установленного пакета `polymarket`; без него они пропускаются.
+
+Диагностика «рынков=0» в проде: `python diag.py` — читает публичный Gamma
+API без ключей и ордеров, печатает актуальные слаги серий, найденные рынки
+с token_id обеих ног и воронку фильтров бота.
 
 Если добавляешь логику стратегии — добавь тест на её инвариант. Если меняешь
 риск-лимиты — проверь, что кросс-валидация в `Settings._validate_cross()`
@@ -150,3 +156,8 @@ python simulate.py --runs 150 --toxicity 0.5
    не даёт |net| дойти до жёсткого лимита (свип в README). Реальный
    рычаг защиты от тренда — STRAT_DIRECTIONAL_MAX_NET, и его ужесточение
    оплачено оборотом спокойных окон почти один в один.
+8. Дефолтные слаги серий (`bitcoin-up-or-down`, `ethereum-up-or-down`) не
+   сверены с живым API: из среды разработки сеть к Polymarket закрыта, а на
+   сайте фигурируют «Up/Down TWAP» рынки. Прогнать `python diag.py` с
+   машины с доступом и, если скан покажет другие слаги, обновить
+   STRAT_SERIES_SLUGS/STRAT_TITLE_KEYWORDS (раздел 3-4 вывода diag).

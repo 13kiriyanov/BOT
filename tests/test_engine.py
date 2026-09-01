@@ -18,6 +18,8 @@ import pytest
 
 pytest.importorskip("polymarket", reason="engine импортирует типы SDK")
 
+from polymarket.pagination import AsyncPaginator, Page  # noqa: E402
+
 from src import engine as engine_mod  # noqa: E402
 from src.engine import TradingEngine  # noqa: E402
 from src.models import Fill, MarketPosition, TargetMarket  # noqa: E402
@@ -99,20 +101,29 @@ class FakeClient:
         self._fail = fail_positions
         self.merge_calls: list[dict] = []
 
-    def list_positions(self):
+    def list_positions(self) -> AsyncPaginator:
+        """
+        Форма как у SDK: НАСТОЯЩИЙ AsyncPaginator поверх Page. Итерация
+        `async for p in paginator` отдаёт страницы, а не позиции, — код,
+        забывший .iter_items(), молча увидит пустой кошелёк. Прежняя
+        заглушка отдавала элементы напрямую и прятала ровно этот баг.
+        По одному элементу на страницу: чтение только первой страницы —
+        тоже провал.
+        """
         outer = self
 
-        class _Iter:
-            def __aiter__(self):
-                if outer._fail is not None:
-                    raise outer._fail
-                return self._gen()
+        async def fetch(cursor: str | None) -> Page:
+            if outer._fail is not None:
+                raise outer._fail
+            idx = int(cursor or 0)
+            has_more = idx + 1 < len(outer._positions)
+            return Page(
+                items=tuple(outer._positions[idx:idx + 1]),
+                has_more=has_more,
+                next_cursor=str(idx + 1) if has_more else None,
+            )
 
-            async def _gen(self):
-                for p in outer._positions:
-                    yield p
-
-        return _Iter()
+        return AsyncPaginator(fetch)
 
     async def merge_positions(self, *, condition_id: str, amount: int):
         self.merge_calls.append({"condition_id": condition_id, "amount": amount})

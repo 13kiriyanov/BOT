@@ -207,10 +207,49 @@ def test_subscribe_is_a_coroutine_returning_handle():
     for attr in ("__aenter__", "__aexit__", "__aiter__", "__anext__", "close"):
         assert hasattr(SubscriptionHandle, attr), attr
 
-    # Пагинаторы, наоборот, НЕ корутины: их зовут без await и сразу
-    # итерируют. Перепутать эти две формы — симметричный способ сломаться.
+    # Пагинаторы, наоборот, НЕ корутины: их зовут без await. Но итерировать
+    # их надо через .iter_items() — см. следующую канарейку.
     for name in ("list_positions", "list_open_orders", "list_series", "list_events"):
         assert not inspect.iscoroutinefunction(getattr(AsyncSecureClient, name)), name
+
+
+# --------------------------------------------- list_*() -> AsyncPaginator
+
+
+def test_paginator_iterates_pages_not_items():
+    """
+    discovery._candidates_* / engine._fetch_positions / _sync_positions_once /
+    execution.sync_open_orders: `async for x in client.list_*()` отдаёт
+    ОБЪЕКТЫ Page, а не элементы. Элементы — только через .iter_items().
+
+    Забытый .iter_items() не падает: у Page нет полей элемента, и любой
+    getattr(page, ..., None) молча превращает ответ API в пустоту — бот
+    «не видит» рынков, позиций и ордеров, выглядя живым. Ровно так все
+    стратегии discovery стабильно возвращали ноль рынков в проде.
+    Если канарейка упала после обновления SDK — перепроверь форму итерации
+    во всех четырёх модулях руками, а не чини тест до зелёного.
+    """
+    import asyncio
+
+    from polymarket.pagination import AsyncPaginator, Page
+
+    async def fetch(cursor: str | None) -> Page:
+        if cursor is None:
+            return Page(items=("a", "b"), has_more=True, next_cursor="1")
+        return Page(items=("c",), has_more=False)
+
+    async def scenario() -> tuple[list, list]:
+        pages = [p async for p in AsyncPaginator(fetch)]
+        items = [x async for x in AsyncPaginator(fetch).iter_items()]
+        return pages, items
+
+    pages, items = asyncio.run(scenario())
+    assert all(isinstance(p, Page) for p in pages), "итерация отдаёт страницы"
+    assert items == ["a", "b", "c"], "элементы, и только через iter_items()"
+    # Page не похож на элемент: духи-атрибуты читаются как пустота — именно
+    # поэтому баг молчал. Фиксируем сам механизм молчания.
+    assert getattr(pages[0], "events", None) is None
+    assert getattr(pages[0], "markets", None) is None
 
 
 # ----------------------------------------------- user-stream: событие trade

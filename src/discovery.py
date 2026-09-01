@@ -24,6 +24,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from statistics import NormalDist
@@ -122,6 +123,42 @@ def implied_strike(
     return Decimal(str(round(k, 2)))
 
 
+@dataclass(slots=True)
+class DiscoveryFunnel:
+    """
+    Счётчики одной итерации поиска: сколько кандидатов пришло и на каком
+    фильтре сколько отсеялось. «Рынков=0» без этой раскладки неотличимо
+    от «поиск сломался» — а это разные аварии с разными починками.
+    """
+
+    series_events: int = 0      # событий из заданных серий
+    search_events: int = 0      # событий из полнотекстового резерва
+    markets_in: int = 0         # рынков внутри пришедших событий
+    drop_state: int = 0         # not active / closed / archived / нет state
+    drop_accepting: int = 0     # accepting_orders=False
+    drop_book: int = 0          # enable_order_book=False
+    drop_no_end: int = 0        # нет даты экспирации
+    drop_window_far: int = 0    # до экспирации больше max (ещё рано)
+    drop_window_near: int = 0   # до экспирации меньше min (уже поздно)
+    drop_no_tokens: int = 0     # нет token_id одной из ног
+    drop_no_asset: int = 0      # не распознан BTC/ETH
+    drop_dup: int = 0           # дубль condition_id
+    drop_overflow: int = 0      # прошли всё, но не влезли в max_markets
+    accepted: int = 0           # итог: сколько рынков торгуем
+
+    def describe(self) -> str:
+        """Одна строка для INFO-лога discovery_loop."""
+        return (
+            f"событий: серии={self.series_events} поиск={self.search_events}; "
+            f"рынков={self.markets_in}, взято={self.accepted}; отсев: "
+            f"состояние={self.drop_state} приём_ордеров={self.drop_accepting} "
+            f"стакан={self.drop_book} без_даты={self.drop_no_end} "
+            f"окно_рано={self.drop_window_far} окно_поздно={self.drop_window_near} "
+            f"токены={self.drop_no_tokens} актив={self.drop_no_asset} "
+            f"дубли={self.drop_dup} сверх_лимита={self.drop_overflow}"
+        )
+
+
 class MarketDiscovery:
     """Периодически ищет подходящие рынки и калибрует страйки."""
 
@@ -146,6 +183,8 @@ class MarketDiscovery:
         # Спот, записанный на момент открытия окна: condition_id -> price.
         self._observed_open: dict[str, Decimal] = {}
         self._strike_cache: dict[str, Decimal] = {}
+        # Воронка последнего find_markets — её печатает discovery_loop.
+        self.last_funnel: DiscoveryFunnel = DiscoveryFunnel()
 
     def observe_window_open(self, condition_id: str, spot: Decimal) -> None:
         """Вызывается движком, когда рынок появился до старта своего окна."""
@@ -159,11 +198,20 @@ class MarketDiscovery:
         for slug in self.series_slugs:
             try:
                 paginator = self.client.list_series(slug=slug, closed=False, page_size=5)
-                async for series in paginator:
+                # Пагинатор итерируется СТРАНИЦАМИ (Page); элементы — только
+                # через iter_items(). См. канарейку в tests/test_units.py.
+                n_series = 0
+                async for series in paginator.iter_items():
+                    n_series += 1
                     for ev in getattr(series, "events", None) or []:
                         events.append(ev)
+                if n_series == 0:
+                    log.warning(
+                        "Серия '%s': API вернул ноль открытых серий — слаг "
+                        "устарел или серия закрыта (проверь diag.py)", slug,
+                    )
             except Exception as exc:  # noqa: BLE001
-                log.debug("Серия %s недоступна: %s", slug, exc)
+                log.warning("Серия '%s' недоступна: %s", slug, exc)
         return events
 
     async def _candidates_from_search(self) -> list:
@@ -175,19 +223,27 @@ class MarketDiscovery:
                     title_search=kw, closed=False, order="endDate",
                     ascending=True, page_size=20,
                 )
-                async for ev in paginator:
+                async for ev in paginator.iter_items():
                     events.append(ev)
             except Exception as exc:  # noqa: BLE001
-                log.debug("Поиск '%s' не удался: %s", kw, exc)
+                log.warning("Поиск по заголовку '%s' не удался: %s", kw, exc)
         return events
 
     async def find_markets(self, spot_prices: dict[str, float]) -> list[TargetMarket]:
         """Вернуть список торгуемых прямо сейчас рынков."""
+        funnel = DiscoveryFunnel()
+        self.last_funnel = funnel
+
         events = await self._candidates_from_series()
+        funnel.series_events = len(events)
         if not events:
             events = await self._candidates_from_search()
+            funnel.search_events = len(events)
         if not events:
-            log.warning("Активных Up/Down рынков не найдено")
+            log.warning(
+                "Активных Up/Down рынков не найдено: серии %s и поиск по %s "
+                "вернули ноль событий", self.series_slugs, self.title_keywords,
+            )
             return []
 
         now = time.time()
@@ -196,42 +252,64 @@ class MarketDiscovery:
 
         for ev in events:
             for m in getattr(ev, "markets", None) or []:
-                target = self._build_target(m, ev, now, spot_prices)
-                if target and target.condition_id not in seen:
-                    seen.add(target.condition_id)
-                    found.append(target)
+                funnel.markets_in += 1
+                target = self._build_target(m, ev, now, spot_prices, funnel)
+                if target is None:
+                    continue
+                if target.condition_id in seen:
+                    funnel.drop_dup += 1
+                    continue
+                seen.add(target.condition_id)
+                found.append(target)
 
         # Ближайшие к экспирации — приоритетнее: там выше активность.
         found.sort(key=lambda t: t.seconds_left)
-        return found[: self.max_markets]
+        result = found[: self.max_markets]
+        funnel.drop_overflow = len(found) - len(result)
+        funnel.accepted = len(result)
+        return result
 
     def _build_target(
-        self, m, ev, now: float, spot_prices: dict[str, float]
+        self, m, ev, now: float, spot_prices: dict[str, float],
+        funnel: DiscoveryFunnel,
     ) -> TargetMarket | None:  # noqa: ANN001
         state = getattr(m, "state", None)
         if state is None or not state.active or state.closed or state.archived:
+            funnel.drop_state += 1
             return None
-        if not state.accepting_orders or not state.enable_order_book:
+        if not state.accepting_orders:
+            funnel.drop_accepting += 1
+            return None
+        if not state.enable_order_book:
+            funnel.drop_book += 1
             return None
 
         end_ts = _parse_ts(getattr(state, "end_date", None))
         if end_ts is None:
+            funnel.drop_no_end += 1
             return None
         left = end_ts - now
-        if not (self.min_seconds <= left <= self.max_seconds):
+        if left > self.max_seconds:
+            funnel.drop_window_far += 1
+            return None
+        if left < self.min_seconds:
+            funnel.drop_window_near += 1
             return None
 
         outcomes = getattr(m, "outcomes", None)
         if outcomes is None or not outcomes.yes or not outcomes.no:
+            funnel.drop_no_tokens += 1
             return None
-        yes_token = str(outcomes.yes.token_id)
-        no_token = str(outcomes.no.token_id)
+        yes_token = str(outcomes.yes.token_id or "")
+        no_token = str(outcomes.no.token_id or "")
         if not yes_token or not no_token:
+            funnel.drop_no_tokens += 1
             return None
 
         text = f"{getattr(m, 'question', '')} {getattr(m, 'slug', '')} {getattr(ev, 'title', '')}"
         asset = detect_asset(text)
         if asset is None:
+            funnel.drop_no_asset += 1
             return None
 
         trading = getattr(m, "trading", None)
