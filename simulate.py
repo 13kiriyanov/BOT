@@ -43,7 +43,12 @@ import statistics
 from decimal import Decimal
 from statistics import NormalDist
 
-from src.fair_value import FairValueModel, VolatilityEstimator
+from src.fair_value import (
+    FairValueModel,
+    RealizedTwap,
+    VolatilityEstimator,
+    twap_probability,
+)
 from src.models import Book, BookLevel, MarketPosition, TargetMarket
 from src.quoting import QuoteGenerator
 from src.regime import Regime, RegimeDetector
@@ -92,6 +97,11 @@ class SimRisk:
 # исполнения; важен знак эффекта: пары в тренде складываться перестают.
 TREND_FLOW_CROWD = 2.5
 TREND_FLOW_STARVE = 0.3
+
+# Паритет с фильтром краёв движка (quote_mid_min/max): рынки с mid вне
+# диапазона бот не котирует — почти решённый исход.
+QUOTE_MID_MIN = 0.10
+QUOTE_MID_MAX = 0.90
 
 Z95 = 1.96
 
@@ -160,8 +170,15 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             fee_rate: Decimal = D("0"), merge_gas: Decimal = D("0.01"),
             trend_prob: float = 0.0, trend_strength: float = 0.0,
             use_regime: bool = False, use_unwind: bool = True,
-            max_net: float | None = None) -> dict:
-    """Одно торговое окно."""
+            max_net: float | None = None,
+            resolution: str = "twap") -> dict:
+    """
+    Одно торговое окно.
+
+    resolution: 'twap' (дефолт, как живые рынки: исход по среднему цены за
+    окно, рынок и модель ценят среднее) или 'endpoint' (историческая
+    модель конечной точки — для сравнительных прогонов).
+    """
     # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
     # seed и разной toxicity получают одинаковые базовую траекторию спота,
     # рыночный шум и лотерею очереди — различия между уровнями создаёт
@@ -187,6 +204,9 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     spot = strike = 100_000.0
     pos = MarketPosition("sim")
     tick_dt = 1.0
+    # Реализованная часть TWAP окна — тем же накопителем, что у движка:
+    # резолюция и модель считают среднее одним и тем же интегратором.
+    twap_acc = RealizedTwap(0.0, float(window_s)) if resolution == "twap" else None
 
     # --- Трендовый режим -------------------------------------------------
     # В доле trend_prob окон спот получает устойчивый снос вместо чистого
@@ -248,8 +268,21 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             if detector.regime in regime_seconds:
                 regime_seconds[detector.regime] += 1
 
-        # Рынок = истинная вероятность + шум.
-        p_true = true_probability(spot, strike, left, sigma)
+        # Рынок = истинная вероятность + шум. В TWAP-режиме «истина» — это
+        # вероятность для СРЕДНЕГО за окно с учётом уже реализованной части:
+        # эффективный рынок ценит ту же величину, что и резолюция.
+        twap_alpha: float | None = None
+        twap_avg: float | None = None
+        if twap_acc is not None:
+            twap_acc.update(spot, now)
+            state = twap_acc.state(now)
+            assert state is not None  # начало окна покрыто по построению
+            twap_alpha, twap_avg = state
+            p_true = twap_probability(
+                spot, strike, left, sigma, alpha=twap_alpha, realized_avg=twap_avg
+            )
+        else:
+            p_true = true_probability(spot, strike, left, sigma)
         p_mkt = min(0.97, max(0.03, p_true + rng_market.gauss(0, market_noise)))
 
         yes_book = make_book(p_mkt, market_spread)
@@ -261,6 +294,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             sigma_annual=vol.sigma_annual,
             drift_per_second=vol.drift_per_second,
             vol_ready=vol.ready,
+            twap_alpha=twap_alpha,
+            twap_realized=twap_avg,
         )
         # --- Разгрузка перекоса: точная копия _unwind_if_needed движка ---
         # Если |net| превысил directional-лимит (у экспирации лимит ужат до
@@ -275,10 +310,14 @@ def run_one(window_s: int, sigma: float, market_noise: float,
                 quotes = quoter.build_unwind_quotes(market, pos, book) or None
 
         if quotes is None:
-            regime_state = detector.state() if detector is not None else None
-            quotes = quoter.build_quotes(
-                market, fv, pos, yes_book, no_book, regime_state
-            )
+            if not (QUOTE_MID_MIN <= p_mkt <= QUOTE_MID_MAX):
+                # Край диапазона: движок такие рынки не котирует.
+                quotes = []
+            else:
+                regime_state = detector.state() if detector is not None else None
+                quotes = quoter.build_quotes(
+                    market, fv, pos, yes_book, no_book, regime_state
+                )
 
         # --- Модель исполнения ------------------------------------------
         # Три эффекта, без которых симуляция врёт в вашу пользу:
@@ -368,8 +407,15 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         if step % 20 == 0 and pos.complete_pairs >= 25:
             pos.apply_merge(pos.complete_pairs, merge_gas)
 
-    # Резолюция остатка.
-    won_yes = spot > strike
+    # Резолюция остатка. Живые рынки: TWAP за окно >= страйка (правила
+    # говорят «greater than or equal»). endpoint — историческое сравнение
+    # конечной цены, оставлено для сравнительных прогонов.
+    if twap_acc is not None:
+        final_state = twap_acc.state(float(window_s))
+        assert final_state is not None
+        won_yes = final_state[1] >= strike
+    else:
+        won_yes = spot > strike
     settle = pos.yes_size if won_yes else pos.no_size
     cost = pos.total_cost
     pairs_done = float(pos.merged_pairs + pos.complete_pairs)
@@ -412,7 +458,8 @@ def run_level(
     tasks = [
         (args.window, args.sigma, args.noise, args.spread, seed,
          toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas),
-         args.trend_prob, args.trend_strength, use_regime, use_unwind, max_net)
+         args.trend_prob, args.trend_strength, use_regime, use_unwind, max_net,
+         args.resolution)
         for seed in range(args.runs)
     ]
     if args.jobs > 1:
@@ -709,6 +756,9 @@ def main() -> None:
     ap.add_argument("--sweep", type=str, default=None,
                     help="уровни toxicity через запятую (например 0.2,0.35,0.5,0.65): "
                          "прогнать все на общих seed'ах и сравнить парно")
+    ap.add_argument("--resolution", choices=["twap", "endpoint"], default="twap",
+                    help="резолюция окна: twap — как живые рынки (дефолт); "
+                         "endpoint — историческая модель конечной точки")
     ap.add_argument("--jobs", type=int, default=1,
                     help="процессов для параллельного прогона")
     args = ap.parse_args()

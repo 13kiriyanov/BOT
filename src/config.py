@@ -96,6 +96,18 @@ class StrategySettings(BaseSettings):
     max_market_spread: Decimal = Decimal("0.06")
     # Не котируем, если суммарная глубина топ-3 уровней меньше (shares).
     min_book_depth: Decimal = Decimal("50")
+    # Не котируем рынки на краях: mid вне [min, max] — почти решённый исход.
+    # Для мейкера там отвратительное отношение риска к награде: победившая
+    # сторона пары стоит ~1 и не наберётся, а проигравшая набирается
+    # мгновенно и сгорает. Наблюдалось вживую: BUY YES @ 0.03 + NO @ 0.94.
+    quote_mid_min: Decimal = Decimal("0.10")
+    quote_mid_max: Decimal = Decimal("0.90")
+    # Сглаживание mid для fair value (полупериод EWMA, сек; 0 = выключено).
+    # Микропрайс дёргается каждым тиком стакана, центр котирования скачет
+    # на 3-4 тика за пару секунд, и бот бесконечно переставляет ордера,
+    # теряя место в очереди. Сглаживаем ВХОД модели; границы (не пересекать
+    # ask, планка пары) считаются по живому стакану как раньше.
+    fair_mid_smoothing_halflife_s: float = 4.0
 
     # --- Комиссии рынка -----------------------------------------------------
     # У части рынков fees_enabled=true. Ставку и экспоненту бот читает из
@@ -263,7 +275,9 @@ class RuntimeSettings(BaseSettings):
         default="INFO", alias="LOG_LEVEL"
     )
     log_dir: str = Field(default="./logs", alias="LOG_DIR")
-    # Источник спот-цены: 'polymarket' (встроенный RTDS-стрим) или 'binance'.
+    # Источник цены для модели: 'polymarket' — Chainlink TWAP-60s через RTDS,
+    # ИСТОЧНИК РЕЗОЛЮЦИИ рынков (по нему же считается страйк); 'binance' —
+    # резерв с базисным риском (другой ряд, чем расчёт рынка) и WARNING.
     price_source: Literal["polymarket", "binance"] = Field(
         default="polymarket", alias="PRICE_SOURCE"
     )
@@ -333,6 +347,10 @@ class Settings:
             raise ValueError("STRAT_STRIKE_DIVERGENCE_HOLD_S должен быть > 0")
         if not (Decimal("0") <= s.pair_sum_warn_gap < s.target_pair_cost):
             raise ValueError("STRAT_PAIR_SUM_WARN_GAP вне разумного диапазона")
+        if not (Decimal("0") <= s.quote_mid_min < s.quote_mid_max <= Decimal("1")):
+            raise ValueError("STRAT_QUOTE_MID_MIN/MAX: нужно 0 <= min < max <= 1")
+        if s.fair_mid_smoothing_halflife_s < 0:
+            raise ValueError("STRAT_FAIR_MID_SMOOTHING_HALFLIFE_S не может быть < 0")
 
 
 def load_settings() -> Settings:

@@ -152,3 +152,37 @@ def test_paired_diff_beats_independent_difference():
     _, half_paired = paired_diff_ci(lo, hi)
     half_independent = (half_lo**2 + half_hi**2) ** 0.5
     assert half_paired < half_independent
+
+
+def test_end_spike_barely_moves_twap_settlement():
+    """
+    ГИПОТЕЗА TWAP-РЕЗОЛЮЦИИ: одиночный шип у конца окна почти не двигает
+    среднее — расчётная величина «медленнее» спота. Тот же шип в модели
+    конечной точки сдвинул бы расчёт на всю величину.
+    """
+    from src.fair_value import RealizedTwap
+
+    acc = RealizedTwap(0.0, 600.0)
+    for t in range(0, 590):
+        acc.update(100_000.0, float(t))
+    for t in range(590, 601):
+        acc.update(101_000.0, float(t))     # шип +1% на последних 10 секундах
+
+    state = acc.state(600.0)
+    assert state is not None
+    _, avg = state
+    # Конечная цена — 101_000; среднее сдвинулось меньше чем на 0.02%.
+    assert avg == pytest.approx(100_000.0 * (1 + 0.01 * 10 / 600), rel=2e-5)
+    assert avg < 100_050.0
+
+
+def test_resolution_flag_is_deterministic_and_changes_outcomes():
+    """twap-режим детерминирован и отличается от endpoint на общих seed'ах."""
+    def run(seed, resolution):
+        return run_one(300, 0.55, 0.012, 0.02, seed, 0.5, 0.45, D("0"),
+                       D("0.01"), 0.0, 0.0, False, True, 120.0, resolution)
+
+    assert run(7, "twap") == run(7, "twap")
+    twap = [run(seed, "twap")["pnl"] for seed in range(12)]
+    endpoint = [run(seed, "endpoint")["pnl"] for seed in range(12)]
+    assert twap != endpoint

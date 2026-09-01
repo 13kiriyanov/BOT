@@ -3,40 +3,36 @@
 
 ПРОБЛЕМА СТРАЙКА
 ----------------
-Рынок «Bitcoin Up or Down 3PM ET» резолвится сравнением цены на момент
-экспирации с ценой на момент открытия окна. Эта опорная цена (страйк) не
-всегда доступна через API: если бот стартовал в середине окна, момент
-открытия уже прошёл.
+Рынок `btc-updown-5m-<ts>` резолвится сравнением TWAP Chainlink за окно со
+значением того же ряда в НАЧАЛЕ окна — это и есть страйк. Через API он не
+отдаётся: если бот стартовал в середине окна, момент начала уже прошёл.
 
-Три стратегии, по убыванию надёжности:
- 1. Бот наблюдал открытие окна -> берём записанный спот.
+Стратегии, по убыванию надёжности:
+ 1. Бот наблюдал начало окна -> записанное значение фида резолюции
+    (движок ловит пересечение start_ts и зовёт observe_window_open).
  2. Страйк указан в описании рынка -> парсим число.
- 3. Инвертируем модель: находим K такое, что GBM-вероятность совпадает с
-    текущим рыночным mid. Модель калибруется на рынок в момент t0, и дальше
-    edge возникает из РАСХОЖДЕНИЯ движения спота и движения рынка.
-    Это не хак: именно так и делают на практике — торгуют изменение, а не
-    уровень, потому что уровень зависит от неизвестного нам параметра.
+ 3. Инверсия TWAP-модели по живому рынку — в ДВИЖКЕ
+    (implied_strike_twap из fair_value.py, нужна реализованная часть окна):
+    находим K, при котором модельная вероятность совпадает с рыночным mid,
+    и дальше edge возникает из РАСХОЖДЕНИЯ движения фида и движения рынка.
+    Это не хак: торгуют изменение, а не уровень, потому что уровень
+    зависит от неизвестного нам параметра.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
-from statistics import NormalDist
+from decimal import Decimal
 
 from polymarket import AsyncSecureClient
 
 from .models import ONE, ZERO, TargetMarket
 
 log = logging.getLogger("polybot.discovery")
-
-SECONDS_PER_YEAR = 365.0 * 24 * 3600
-_ND = NormalDist()
 
 # Определение актива по тексту вопроса/слага.
 ASSET_PATTERNS = {
@@ -117,29 +113,10 @@ def parse_strike_from_text(text: str, spot_hint: float | None) -> Decimal | None
     return Decimal(str(best))
 
 
-def implied_strike(
-    spot: float, market_prob: float, seconds_left: float, sigma_annual: float
-) -> Decimal | None:
-    """
-    Обратить GBM: найти K, при котором P(S_T > K) == market_prob.
-
-        d = (ln(S/K) - 0.5*sigma^2*tau) / (sigma*sqrt(tau)) = Phi^-1(p)
-        =>  K = S * exp(-Phi^-1(p) * sigma * sqrt(tau) - 0.5*sigma^2*tau)
-    """
-    p = min(max(market_prob, 0.02), 0.98)  # клип, иначе inv_cdf -> +-inf
-    tau_y = max(seconds_left, 5.0) / SECONDS_PER_YEAR
-    sigma = max(sigma_annual, 1e-4)
-    vol_term = sigma * math.sqrt(tau_y)
-    if vol_term < 1e-9:
-        return None
-    try:
-        z = _ND.inv_cdf(p)
-    except (ValueError, InvalidOperation):
-        return None
-    k = spot * math.exp(-z * vol_term - 0.5 * sigma**2 * tau_y)
-    if k <= 0 or not math.isfinite(k):
-        return None
-    return Decimal(str(round(k, 2)))
+# Инверсия модели «конечная точка» жила здесь до подтверждения TWAP-правил
+# резолюции. Рынок ценит СРЕДНЕЕ по окну — правильная инверсия теперь
+# implied_strike_twap в fair_value.py (её зовёт движок с реализованной
+# частью окна из RealizedTwap).
 
 
 @dataclass(slots=True)

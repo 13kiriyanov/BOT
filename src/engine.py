@@ -26,9 +26,9 @@ from decimal import Decimal
 from polymarket import AsyncSecureClient
 
 from .config import Settings
-from .discovery import MarketDiscovery, implied_strike
+from .discovery import MarketDiscovery
 from .execution import OrderManager
-from .fair_value import FairValueModel
+from .fair_value import FairValueModel, RealizedTwap, implied_strike_twap
 from .logging_setup import log_event
 from .markout import MarkoutTracker
 from .models import (
@@ -119,6 +119,12 @@ class TradingEngine:
         # "invalidations", "blocked"}. blocked=True — модель по рынку
         # отключена до конца окна (страйк дважды признан невалидным).
         self._strike_meta: dict[str, dict] = {}
+        # Реализованная часть TWAP по каждому рынку (окно [start_ts, end_ts]).
+        # Кормится тиками фида резолюции; без покрытого начала окна модель
+        # для рынка не работает (state() вернёт None).
+        self._twap: dict[str, RealizedTwap] = {}
+        # Сглаженный mid (EWMA) для fair value: condition_id -> (value, ts).
+        self._mid_ewma: dict[str, tuple[float, float]] = {}
         # Момент последнего филла или merge по рынку: сверка позиций не
         # трогает рынки со свежей активностью (data-api отстаёт от CLOB).
         self._last_activity: dict[str, float] = {}
@@ -349,6 +355,12 @@ class TradingEngine:
         detector = self._regime_for(asset)
         detector.on_spot(price, ts)
         self._note_regime_change(asset, detector)
+        # Реализованная часть TWAP всех рынков этого актива.
+        for market in self.markets.values():
+            if market.asset == asset:
+                tracker = self._twap.get(market.condition_id)
+                if tracker is not None:
+                    tracker.update(price, ts)
 
     def _note_regime_change(self, asset: str, detector: RegimeDetector) -> None:
         current = detector.regime
@@ -494,6 +506,13 @@ class TradingEngine:
                     )
                     self.orders.register_market(cid, m.yes_token_id, m.no_token_id)  # type: ignore[union-attr]
                     self._confirm_recovered(m)
+                    # Накопитель реализованной части TWAP. Если бот увидел
+                    # рынок после начала окна, накопитель сам признает
+                    # начало непокрытым и модель для рынка не включится.
+                    if m.start_ts is not None:
+                        self._twap.setdefault(
+                            cid, RealizedTwap(m.start_ts, m.end_ts)
+                        )
 
                 # Ставку, выученную из филла, возвращаем на место: объекты
                 # рынков здесь пересоздаются, а знание о комиссии — нет.
@@ -524,6 +543,8 @@ class TradingEngine:
         self.discovery.forget(market.condition_id)  # type: ignore[union-attr]
         self.markout.forget_market(market.condition_id)
         self._strike_meta.pop(market.condition_id, None)
+        self._twap.pop(market.condition_id, None)
+        self._mid_ewma.pop(market.condition_id, None)
 
     def _book_for(self, market: TargetMarket, outcome: str) -> Book | None:
         """Стакан токена, при необходимости восстановленный из дополнения."""
@@ -609,12 +630,39 @@ class TradingEngine:
         if mid is None:
             return []
 
+        # Крайние рынки не котируем: почти решённый исход — отвратительное
+        # отношение риска к награде для мейкера (наблюдалось вживую:
+        # BUY YES @ 0.03 + BUY NO @ 0.94). Разгрузка позиции разрешена.
+        if not (
+            self.cfg.strategy.quote_mid_min
+            <= mid
+            <= self.cfg.strategy.quote_mid_max
+        ):
+            log.debug(
+                "[%s] mid=%.3f вне диапазона котирования [%s, %s] — только "
+                "разгрузка", market.slug, float(mid),
+                self.cfg.strategy.quote_mid_min, self.cfg.strategy.quote_mid_max,
+            )
+            return self._unwind_if_needed(market, pos, yes_book, no_book)
+
+        # Сглаженный mid — ВХОД модели и якорь fair: микропрайс дёргается
+        # каждым тиком стакана, и без сглаживания центр котирования скачет
+        # на 3-4 тика за секунды (бесконечный cancel/replace, потеря места
+        # в очереди). Границы цен ниже считаются по живому стакану.
+        smoothed_mid = self._smoothed_mid(market.condition_id, float(mid))
+
         spot = self.spot.price(market.asset)
-        if spot is None or market.strike is None:
-            # Без спота или страйка модель не работает — чистый MM по рынку.
+        tracker = self._twap.get(market.condition_id)
+        twap_state = tracker.state(time.time()) if tracker is not None else None
+
+        if spot is None or market.strike is None or twap_state is None:
+            # Без цены фида, страйка или покрытого начала окна модель не
+            # работает — чистый MM по рынку. (Начало окна не наблюдалось =>
+            # реализованная часть TWAP неизвестна, и честной вероятности
+            # среднего не существует.)
             fv = self.fv_model.compute(
                 spot=1.0, strike=1.0, seconds_left=market.seconds_left,
-                market_mid=mid, sigma_annual=0.5,
+                market_mid=smoothed_mid, sigma_annual=0.5,
                 drift_per_second=0.0, vol_ready=False,
             )
         else:
@@ -622,10 +670,12 @@ class TradingEngine:
                 spot=spot,
                 strike=float(market.strike),
                 seconds_left=market.seconds_left,
-                market_mid=mid,
+                market_mid=smoothed_mid,
                 sigma_annual=self.spot.sigma(market.asset),
                 drift_per_second=self.spot.drift(market.asset),
                 vol_ready=self.spot.vol_ready(market.asset),
+                twap_alpha=twap_state[0],
+                twap_realized=twap_state[1],
             )
 
         # Сторож расхождения: модель, устойчиво спорящая с рынком на порог,
@@ -633,12 +683,12 @@ class TradingEngine:
         # защита: он оставляет fair сдвинутым на всю величину клипа, и обе
         # ноги котируются там, где их никогда не исполнят.
         if market.strike is not None and float(fv.confidence) > 0:
-            if self._check_model_divergence(market, fv, mid, spot):
+            if self._check_model_divergence(market, fv, smoothed_mid, spot):
                 # Страйк только что снят — пересчитываем fair чистым MM
                 # по рынку, не дожидаясь следующего цикла.
                 fv = self.fv_model.compute(
                     spot=1.0, strike=1.0, seconds_left=market.seconds_left,
-                    market_mid=mid, sigma_annual=0.5,
+                    market_mid=smoothed_mid, sigma_annual=0.5,
                     drift_per_second=0.0, vol_ready=False,
                 )
 
@@ -680,6 +730,22 @@ class TradingEngine:
                 q.size = size
                 result.append(q)
         return result
+
+    def _smoothed_mid(self, condition_id: str, mid: float) -> Decimal:
+        """EWMA рыночного mid; при выключенном сглаживании — сырое значение."""
+        halflife = self.cfg.strategy.fair_mid_smoothing_halflife_s
+        if halflife <= 0:
+            return Decimal(str(round(mid, 6)))
+        now = time.time()
+        prev = self._mid_ewma.get(condition_id)
+        if prev is None:
+            value = mid
+        else:
+            prev_value, prev_ts = prev
+            lam = 0.5 ** (max(now - prev_ts, 0.0) / halflife)
+            value = lam * prev_value + (1.0 - lam) * mid
+        self._mid_ewma[condition_id] = (value, now)
+        return Decimal(str(round(value, 6)))
 
     # ------------------------------------------------- страйк: живые данные
 
@@ -726,13 +792,20 @@ class TradingEngine:
             )
             return
 
-        # 2. Инверсия модели по живому рынку.
+        # 2. Инверсия TWAP-модели по живому рынку.
         if not spot_fresh or market.seconds_left < STRIKE_CALIB_MIN_SECONDS:
             return
         if market.start_ts is not None and now < market.start_ts:
             # До открытия окна mid не несёт информации о будущем страйке.
             return
         if not self.spot.vol_ready(market.asset) or yes_book is None:
+            return
+        # Рынок ценит TWAP — инвертировать надо TWAP-модель, а для неё
+        # нужна реализованная часть окна. Начало окна не покрыто => модель
+        # всё равно не включится, калибровать незачем.
+        tracker = self._twap.get(cid)
+        twap_state = tracker.state(now) if tracker is not None else None
+        if twap_state is None:
             return
         mid = yes_book.microprice() or yes_book.mid
         if mid is None:
@@ -741,15 +814,20 @@ class TradingEngine:
         if not (lo <= float(mid) <= hi):
             return
         sigma = self.spot.sigma(market.asset)
-        strike = implied_strike(spot, float(mid), market.seconds_left, sigma)  # type: ignore[arg-type]
+        strike = implied_strike_twap(
+            spot, float(mid), market.seconds_left, sigma,  # type: ignore[arg-type]
+            alpha=twap_state[0], realized_avg=twap_state[1],
+        )
         if strike is None:
             return
         market.strike = strike
         if self.discovery is not None:
             self.discovery.set_strike(cid, strike)
         log.info(
-            "[%s] Страйк калиброван по живому рынку: K=%s (spot=%.2f mid=%.4f "
-            "sigma=%.2f)", market.slug, strike, spot, float(mid), sigma,
+            "[%s] Страйк калиброван по живому рынку (TWAP): K=%s (spot=%.2f "
+            "mid=%.4f sigma=%.2f alpha=%.2f реализовано=%.2f)",
+            market.slug, strike, spot, float(mid), sigma,
+            twap_state[0], twap_state[1],
         )
 
     def _check_model_divergence(

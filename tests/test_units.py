@@ -257,43 +257,52 @@ def test_paginator_iterates_pages_not_items():
 
 def test_crypto_prices_payload_shape_and_filter_contract():
     """
-    price_feed.run_polymarket: payload несёт symbol (регистр НЕ нормализован
-    моделью) и value (Decimal). Фильтр symbols подписки — КЛИЕНТСКИЙ и
-    сравнивает строки ТОЧНО, без .lower() (в отличие от equity-фильтра):
-    spec с "BTCUSDT" при wire-символе "btcusdt" молча отбрасывает каждое
-    событие ещё в SDK — подписка «работает», ingest() не вызывается ни разу,
-    все рынки блокируются по «спот-фид протух». Поэтому мы подписываемся на
-    весь топик (symbols не передаём) и фильтруем сами через
-    normalize_rtds_symbol. Если канарейка упала после обновления SDK —
-    перепроверь и форму payload, и семантику фильтра руками.
+    price_feed.run_polymarket: фид резолюции — Chainlink TWAP-60s. Wire-форма
+    payload: symbol (нижний регистр со слэшем, 'btc/usd'), timestamp,
+    value + ОБЯЗАТЕЛЬНЫЙ full_accuracy_value (целое со шкалой 1e18 — из
+    него SDK и берёт точное значение), window_s (алиас window_seconds).
+    Фильтр symbols подписки — КЛИЕНТСКИЙ и сравнивает строки ТОЧНО, без
+    .lower() (в отличие от equity-фильтра): несовпадение формата символа
+    молча отбрасывает каждое событие ещё в SDK — подписка «работает»,
+    ingest() не вызывается ни разу. Поэтому подписываемся на весь топик
+    (symbols не передаём) и фильтруем сами через normalize_rtds_symbol.
+    Если канарейка упала после обновления SDK — перепроверь и форму
+    payload, и семантику фильтра руками.
     """
     from polymarket._internal.streams.rtds.protocol import matcher_for
-    from polymarket.models.rtds_events import CryptoPricesBinanceEvent
-    from polymarket.streams import CryptoPricesSpec
+    from polymarket.models.rtds_events import CryptoPricesChainlinkTwapEvent
+    from polymarket.streams import CryptoPricesChainlinkTwapSpec
 
-    ev = CryptoPricesBinanceEvent.model_validate({
+    ev = CryptoPricesChainlinkTwapEvent.model_validate({
         "type": "update", "timestamp": 1788276000000,
-        "payload": {"symbol": "btcusdt", "timestamp": 1788276000,
-                    "value": "109521.55"},
+        "payload": {
+            "symbol": "btc/usd", "timestamp": 1788276000,
+            "value": "109521.55",
+            "full_accuracy_value": "109521550000000000000000",
+            "window_s": 60,
+        },
     })
-    assert ev.payload.symbol == "btcusdt"        # как пришло, без upper()
+    assert ev.topic == "prices.crypto.chainlink.twap"
+    assert ev.payload.symbol == "btc/usd"        # как пришло, без upper()
+    # Точное значение — из full_accuracy_value (1e18), а не из value.
     assert ev.payload.value == D("109521.55")
+    assert ev.payload.window_seconds == 60
 
     # Спека допускает подписку на весь топик — на этом стоит наш фикс.
-    assert CryptoPricesSpec(topic="prices.crypto.binance").symbols is None
+    spec_wide = CryptoPricesChainlinkTwapSpec(window_seconds=60)
+    assert spec_wide.symbols is None
 
-    # Сам механизм бага, закреплённый как контракт: точечный фильтр в
-    # верхнем регистре НЕ пропускает wire-событие в нижнем.
-    uppercase_filter = matcher_for(
-        CryptoPricesSpec(topic="prices.crypto.binance", symbols=["BTCUSDT"])
+    # Механизм прошлого бага, закреплённый как контракт: точечный фильтр
+    # в «неправильном» формате НЕ пропускает wire-событие.
+    exact_filter = matcher_for(
+        CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=["BTC/USD"])
     )
-    assert uppercase_filter(ev) is False
-    topic_wide = matcher_for(CryptoPricesSpec(topic="prices.crypto.binance"))
-    assert topic_wide(ev) is True
+    assert exact_filter(ev) is False
+    assert matcher_for(spec_wide)(ev) is True
 
     from src.price_feed import POLY_SYMBOLS, normalize_rtds_symbol
 
-    for wire in ("btcusdt", "BTCUSDT", "BTC/USDT", "btc-usdt", "BTC/USD"):
+    for wire in ("btc/usd", "BTC/USD", "btcusdt", "BTC/USDT", "btc-usdt"):
         assert POLY_SYMBOLS[normalize_rtds_symbol(wire)] == "BTC", wire
 
 

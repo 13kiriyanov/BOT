@@ -116,26 +116,25 @@ def test_user_stream_consumes_events_through_sdk_shaped_subscribe():
     assert client.calls >= 2
 
 
-def test_price_feed_consumes_real_rtds_events_with_wire_symbols():
+def test_price_feed_consumes_real_chainlink_twap_events():
     """
-    price_feed.run_polymarket: события — НАСТОЯЩИЕ модели RTDS SDK, символы
-    в форме провода (нижний регистр, вариант со слэшем) — оба тика доезжают
-    до self.price(). Прежняя заглушка со symbol="BTCUSDT" (верхний регистр)
-    прятала живой баг: точечная подписка с верхним регистром молча теряла
-    каждое событие ещё в фильтре SDK, ingest() не вызывался ни разу.
+    price_feed.run_polymarket: события — НАСТОЯЩИЕ модели RTDS SDK для
+    потока резолюции (Chainlink TWAP-60s), символы в форме провода
+    ('btc/usd') доезжают до self.price(). Заглушка с «удобным» символом
+    прятала бы живой баг фильтра, как это уже случилось с binance-топиком.
     """
-    from polymarket.models.rtds_events import CryptoPricesBinanceEvent
+    from polymarket.models.rtds_events import CryptoPricesChainlinkTwapEvent
 
-    ev_btc = CryptoPricesBinanceEvent.model_validate({
-        "type": "update", "timestamp": 1788276000000,
-        "payload": {"symbol": "btcusdt", "timestamp": 1788276000,
-                    "value": "100500.5"},
-    })
-    ev_eth = CryptoPricesBinanceEvent.model_validate({
-        "type": "update", "timestamp": 1788276000500,
-        "payload": {"symbol": "ETH/USDT", "timestamp": 1788276000,
-                    "value": "4200.25"},
-    })
+    def twap_event(symbol: str, value: str, e18: str) -> object:
+        return CryptoPricesChainlinkTwapEvent.model_validate({
+            "type": "update", "timestamp": 1788276000000,
+            "payload": {"symbol": symbol, "timestamp": 1788276000,
+                        "value": value, "full_accuracy_value": e18,
+                        "window_s": 60},
+        })
+
+    ev_btc = twap_event("btc/usd", "100500.5", "100500500000000000000000")
+    ev_eth = twap_event("eth/usd", "4200.25", "4200250000000000000000")
     client = FakeStreamClient([ev_btc, ev_eth])
     feed = SpotFeed(vol_halflife_s=45.0, momentum_halflife_s=8.0,
                     vol_floor_annual=D("0.30"))
@@ -146,9 +145,11 @@ def test_price_feed_consumes_real_rtds_events_with_wire_symbols():
     assert feed.price("BTC") == 100500.5
     assert feed.price("ETH") == 4200.25
     assert client.calls >= 2
-    # Подписка обязана быть ТОПИКОВОЙ: клиентский фильтр symbols в SDK
-    # сравнивает строки точно, и несовпадение формата молча убивает фид.
+    # Подписка обязана быть ТОПИКОВОЙ (symbols=None): клиентский фильтр
+    # symbols в SDK сравнивает строки точно, несовпадение формата молча
+    # убивает фид. И ровно на окно резолюции — 60 секунд.
     assert client.specs and client.specs[0].symbols is None
+    assert client.specs[0].window_seconds == 60
 
 
 def test_orderbook_consumes_snapshots_through_sdk_shaped_subscribe():
