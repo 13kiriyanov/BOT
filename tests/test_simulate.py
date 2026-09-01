@@ -112,6 +112,30 @@ def test_trending_windows_starve_pairs_and_grow_residual():
     )
 
 
+def test_unwind_matches_engine_and_reduces_residual():
+    """
+    Разгрузка (паритет с _unwind_if_needed движка) должна продавать
+    односторонний излишек: остаток на общих seed'ах меньше, чем без неё,
+    и продажи реально происходят. Если это сломалось — оценка урона
+    тренда снова завышена артефактом модели.
+    """
+    import statistics
+
+    def run(seed, use_unwind):
+        return run_one(300, 0.55, 0.012, 0.02, seed, 0.5, 0.45, D("0"),
+                       D("0.01"), 1.0, 1.5, False, use_unwind, 120.0)
+
+    with_unwind = [run(seed, True) for seed in range(30)]
+    without = [run(seed, False) for seed in range(30)]
+
+    res_with = statistics.mean(r["abs_residual"] for r in with_unwind)
+    res_without = statistics.mean(r["abs_residual"] for r in without)
+    assert res_with < res_without * 0.8
+    assert statistics.mean(r["unwound"] for r in with_unwind) > 0
+    # Без разгрузки продаж не бывает вовсе.
+    assert all(r["unwound"] == 0 for r in without)
+
+
 def test_paired_diff_beats_independent_difference():
     """
     Смысл общих seed'ов: парная разность уровней точнее, чем разность

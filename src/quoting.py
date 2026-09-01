@@ -354,8 +354,14 @@ class QuoteGenerator:
         b = book
         if b is None or b.best_bid is None:
             return []
-        # Агрессивно, но не в рынок: встаём на лучший бид.
-        price = clamp_price(round_to_tick(b.best_bid, tick, ROUND_UP), tick)
+        # Агрессивно, но не в рынок: на тик ВЫШЕ лучшего бида — самый
+        # агрессивный аск, который ещё не кроссит книгу. Продажа ПО цене
+        # бида была бы marketable, и post_only-ордер биржа отклонит: с
+        # прежней ценой разгрузка вживую не исполнялась бы никогда.
+        price = round_to_tick(b.best_bid, tick, ROUND_UP) + tick
+        if price > ONE - tick:
+            # Бид у потолка цены: некроссящего мейкер-аска не существует.
+            return []
 
         log.info("[%s] Разгрузка %s %s @ %s", market.slug, outcome, size, price)
         return [Quote(token, outcome, "SELL", price, size)]  # type: ignore[arg-type]
