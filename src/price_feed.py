@@ -1,14 +1,21 @@
 """
-Фид спот-цены BTC/ETH.
+Фид цены BTC/ETH для модели.
 
 Два источника:
-1. 'polymarket' — встроенный RTDS-стрим SDK (topic 'prices.crypto.binance').
-   Предпочтителен: это ровно те цены, по которым Polymarket резолвит рынки,
-   значит нет базисного риска между твоей моделью и расчётом рынка.
-2. 'binance'  — прямой WebSocket Binance. Ниже задержка, но появляется риск
-   расхождения с источником резолюции Polymarket.
+1. 'polymarket' — Chainlink TWAP-60s через RTDS SDK
+   (CryptoPricesChainlinkTwapSpec, топик 'prices.crypto.chainlink.twap').
+   ЭТО ИСТОЧНИК РЕЗОЛЮЦИИ: по правилам updown-рынков исход считается по
+   TWAP Chainlink («not according to any other sources or spot markets»),
+   и страйк — значение этого же ряда в начале окна. Никакого базисного
+   риска между моделью и расчётом рынка.
+2. 'binance' — прямой WebSocket Binance. РЕЗЕРВ с базисным риском: это
+   другой ряд, чем тот, по которому рынок рассчитается; при подключении
+   логируется WARNING.
 
-Оба варианта обновляют один и тот же VolatilityEstimator.
+Оба варианта обновляют один и тот же VolatilityEstimator. В варианте
+'polymarket' сигма оценивается по самому TWAP-ряду — сглаженному, то есть
+менее волатильному, чем спот. Это не ошибка, а самосогласованность:
+TWAP-модель fair value моделирует именно этот ряд.
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from typing import Callable
 
 import websockets
 from polymarket import AsyncSecureClient
-from polymarket.streams import CryptoPricesSpec
+from polymarket.streams import CryptoPricesChainlinkTwapSpec
 
 from .fair_value import VolatilityEstimator
 
@@ -115,18 +122,23 @@ class SpotFeed:
     # -------------------------------------------------------------- runners
 
     async def run_polymarket(self, client: AsyncSecureClient) -> None:
-        """Подписка на встроенный крипто-фид Polymarket с авто-переподключением."""
-        # БЕЗ symbols: клиентский фильтр SDK сравнивает символы точно, и
-        # несовпадение формата (регистр/разделитель) молча убивает весь фид.
-        # Весь топик — это десятки пар с частотой цен, фильтрация на нашей
-        # стороне дешёвая. См. normalize_rtds_symbol.
-        spec = CryptoPricesSpec(topic="prices.crypto.binance")
+        """Подписка на поток резолюции (Chainlink TWAP-60s) с переподключением."""
+        # Окно 60 секунд — ровно тот поток, на который ссылаются правила
+        # рынков (btc-usd-twap-60s-streams). БЕЗ symbols: клиентский фильтр
+        # SDK сравнивает символы точно, и несовпадение формата
+        # (регистр/разделитель) молча убивает весь фид. Символы этого топика
+        # по докстрингу SDK — нижний регистр со слэшем ('btc/usd'), их
+        # покрывает normalize_rtds_symbol; фильтрация на нашей стороне.
+        spec = CryptoPricesChainlinkTwapSpec(window_seconds=60)
         backoff = 1.0
         first_tick_logged = False
         unmatched_seen: set[str] = set()
         while not self._stop.is_set():
             try:
-                log.info("Подключаюсь к Polymarket crypto price stream")
+                log.info(
+                    "Подключаюсь к потоку резолюции Chainlink TWAP-60s "
+                    "(prices.crypto.chainlink.twap)"
+                )
                 # subscribe() — корутина: await возвращает handle-CM.
                 async with await client.subscribe(spec) as stream:
                     backoff = 1.0
@@ -139,6 +151,11 @@ class SpotFeed:
                         symbol = getattr(payload, "symbol", None)
                         value = getattr(payload, "value", None)
                         if symbol is None or value is None:
+                            continue
+                        # Защита от чужого окна TWAP, если фильтр SDK
+                        # пропустит его при обновлении.
+                        window = getattr(payload, "window_seconds", None)
+                        if window is not None and window != 60:
                             continue
                         if not first_tick_logged:
                             # Живое доказательство формата символа по проводу.
@@ -163,6 +180,12 @@ class SpotFeed:
 
     async def run_binance(self, ws_url: str) -> None:
         """Прямой WebSocket Binance (bookTicker — mid по лучшим bid/ask)."""
+        log.warning(
+            "PRICE_SOURCE=binance — РЕЗЕРВНЫЙ источник с базисным риском: "
+            "рынки резолвятся по Chainlink TWAP, а не по Binance-споту. "
+            "Модель и страйк будут считаться по другому ряду, чем расчёт "
+            "рынка. Для боевой торговли используй PRICE_SOURCE=polymarket."
+        )
         url = f"{ws_url}?streams={'/'.join(BINANCE_STREAMS)}"
         backoff = 1.0
         while not self._stop.is_set():

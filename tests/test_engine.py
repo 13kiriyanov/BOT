@@ -75,6 +75,11 @@ class Cfg:
         strike_divergence_threshold = D("0.25")
         strike_divergence_hold_s = 8.0
         pair_sum_warn_gap = D("0.05")
+        quote_mid_min = D("0.10")
+        quote_mid_max = D("0.90")
+        fair_mid_smoothing_halflife_s = 4.0
+        max_market_spread = D("0.06")
+        min_book_depth = D("50")
 
     class risk:
         max_position_per_side = D("250")
@@ -622,27 +627,49 @@ def test_strike_observed_at_window_open_crossing():
     assert late.strike is None
 
 
+def make_tracker(engine: TradingEngine, cid: str, start_ts: float,
+                 end_ts: float, price: float = 109_500.0):
+    """Трекер TWAP с покрытым началом окна, скормленный ценой фида."""
+    from src.fair_value import RealizedTwap
+
+    tracker = RealizedTwap(start_ts, end_ts)
+    tracker.update(price, start_ts - 1.0)      # тик до старта: начало покрыто
+    tracker.update(price, time.time())
+    engine._twap[cid] = tracker
+    return tracker
+
+
 def test_strike_deferred_calibration_uses_live_book_and_sigma():
     """
-    Отложенная инверсия GBM: живой mid нашего стакана + свежий спот + живая
-    сигма. При mid около 0.5 страйк обязан лечь рядом со спотом.
+    Отложенная инверсия TWAP-модели: живой mid нашего стакана + свежий фид
+    + живая сигма + реализованная часть окна. При mid около 0.5 страйк
+    обязан лечь рядом с текущим значением фида.
     """
     engine = make_engine(FakeClient())
     spot = warm_spot(engine)
-    market = make_market(start_ts=time.time() - 30.0)
+    now = time.time()
+    market = make_market(start_ts=now - 30.0)
+    make_tracker(engine, "0xcond", now - 30.0, now + 270.0, price=spot)
 
     engine._try_calibrate_strike(market, live_book("0.50", "0.52"))
 
     assert market.strike is not None
     assert abs(float(market.strike) / spot - 1.0) < 0.01
 
+    # Без покрытого начала окна реализованная часть TWAP неизвестна —
+    # инвертировать нечего, страйк не калибруем.
+    naked = make_market(condition_id="0xnaked", start_ts=now - 30.0)
+    engine._try_calibrate_strike(naked, live_book("0.50", "0.52"))
+    assert naked.strike is None
+
     # До открытия окна mid ничего не знает о будущем страйке — не калибруем.
-    pre = make_market(condition_id="0xpre", start_ts=time.time() + 60.0)
+    pre = make_market(condition_id="0xpre", start_ts=now + 60.0)
     engine._try_calibrate_strike(pre, live_book("0.50", "0.52"))
     assert pre.strike is None
 
     # Экстремальный mid: наклон inv_cdf на краю огромен — не калибруем.
-    edge = make_market(condition_id="0xedge", start_ts=time.time() - 30.0)
+    edge = make_market(condition_id="0xedge", start_ts=now - 30.0)
+    make_tracker(engine, "0xedge", now - 30.0, now + 270.0, price=spot)
     engine._try_calibrate_strike(edge, live_book("0.95", "0.97"))
     assert edge.strike is None
 
@@ -731,3 +758,81 @@ def test_divergence_watchdog_invalidates_then_blocks(caplog):
     market.start_ts = time.time() - 30.0
     engine._try_calibrate_strike(market, live_book("0.50", "0.52"))
     assert market.strike is None
+
+
+# ------------------------------------------- TWAP-гейт, фильтр краёв, EWMA
+
+
+def put_books(engine: TradingEngine, yes_bid: str, yes_ask: str) -> None:
+    """Живые стаканы YES/NO в зеркале движка (NO — дополнение YES)."""
+    yes = live_book(yes_bid, yes_ask)
+    no = Book(
+        token_id="tok_no",
+        bids=[BookLevel(D("1") - D(yes_ask), D("100"))],
+        asks=[BookLevel(D("1") - D(yes_bid), D("80"))],
+        updated_at=time.time(),
+    )
+    engine.books._books["tok_yes"] = yes
+    engine.books._books["tok_no"] = no
+
+
+def test_extreme_mid_market_is_not_quoted():
+    """mid вне [quote_mid_min, quote_mid_max] — не котируем (края)."""
+    engine = make_engine(FakeClient())
+    warm_spot(engine)
+    market = make_market(strike=D("109500"))
+    engine.markets["0xcond"] = market
+    put_books(engine, "0.94", "0.96")      # mid ~0.95 — почти решённый исход
+
+    quotes = asyncio.run(engine._quotes_for_market(market))
+    assert quotes == []
+
+    # В рабочем диапазоне тот же рынок котируется.
+    put_books(engine, "0.50", "0.52")
+    quotes = asyncio.run(engine._quotes_for_market(market))
+    assert len(quotes) == 2
+
+
+def test_model_requires_covered_twap_window():
+    """
+    Без трекера с покрытым началом окна модель не работает (чистый MM):
+    сторож расхождения даже не взводится. С трекером — модель живёт, и
+    заведомо ложный страйк немедленно взводит сторож.
+    """
+    engine = make_engine(FakeClient())
+    spot = warm_spot(engine)
+    now = time.time()
+    market = make_market(strike=D(str(round(spot * 1.05, 2))),  # ложный страйк
+                         start_ts=now - 30.0)
+    engine.markets["0xcond"] = market
+    put_books(engine, "0.50", "0.52")
+
+    # Трекера нет -> fallback без модели -> сторож молчит.
+    asyncio.run(engine._quotes_for_market(market))
+    assert engine._strike_meta.get("0xcond", {}).get("diverged_since") is None
+
+    # Трекер с покрытым началом -> модель работает -> расхождение взведено.
+    make_tracker(engine, "0xcond", now - 30.0, now + 270.0, price=spot)
+    asyncio.run(engine._quotes_for_market(market))
+    assert engine._strike_meta["0xcond"]["diverged_since"] is not None
+
+
+def test_smoothed_mid_damps_jitter_and_can_be_disabled():
+    engine = make_engine(FakeClient())
+    first = engine._smoothed_mid("0xcond", 0.62)
+    assert float(first) == pytest.approx(0.62)
+    # Скачок на 4 тика через долю секунды: при полупериоде 4 с сглаженный
+    # сдвигается лишь на малую долю скачка — центр котирования не дёргается.
+    time.sleep(0.1)
+    second = float(engine._smoothed_mid("0xcond", 0.58))
+    assert 0.58 < second < 0.62
+    assert abs(second - 0.62) < 0.04 * 0.2   # ушёл меньше чем на 20% скачка
+
+    class NoSmoothing(Cfg):
+        class strategy(Cfg.strategy):
+            fair_mid_smoothing_halflife_s = 0.0
+
+    raw_engine = TradingEngine(NoSmoothing())  # type: ignore[arg-type]
+    raw_engine.client = FakeClient()  # type: ignore[assignment]
+    raw_engine._smoothed_mid("0xcond", 0.62)
+    assert float(raw_engine._smoothed_mid("0xcond", 0.58)) == pytest.approx(0.58)

@@ -805,3 +805,117 @@ def test_healthy_pair_sum_does_not_warn(market, books, caplog):
         quotes = q.build_quotes(market, fv, MarketPosition("0xcond"), yes, no)
     assert len(quotes) == 2
     assert not [r for r in caplog.records if "ниже цели" in r.message]
+
+
+# ------------------------------------------------------- TWAP-модель
+
+
+def test_twap_atm_at_window_open_is_half():
+    """В начале окна (alpha=0) при S == K вероятность ~0.5."""
+    from src.fair_value import twap_probability
+
+    p = twap_probability(100_000.0, 100_000.0, 300.0, 0.5, alpha=0.0)
+    assert p == pytest.approx(0.5, abs=0.01)
+
+
+def test_twap_variance_is_tighter_than_endpoint_from_start():
+    """
+    Даже при alpha=0 дисперсия среднего втрое меньше дисперсии конца:
+    при том же отклонении S от K TWAP-модель увереннее точечной.
+    """
+    from src.fair_value import twap_probability
+
+    m = FairValueModel(D("1.0"), D("0"), D("1.0"))
+    s, k = 100_100.0, 100_000.0
+    p_end = m.model_probability(s, k, 300, 0.5, 0.0)
+    p_twap = twap_probability(s, k, 300.0, 0.5, alpha=0.0)
+    assert p_twap > p_end > 0.5
+
+
+def test_twap_confidence_grows_faster_toward_window_end():
+    """
+    Цена держится чуть выше страйка всё окно. По мере накопления
+    реализованной части уверенность TWAP-модели растёт быстрее точечной
+    при том же оставшемся времени, и растёт монотонно с alpha.
+    """
+    from src.fair_value import twap_probability
+
+    m = FairValueModel(D("1.0"), D("0"), D("1.0"))
+    k = 100_000.0
+    s = avg = k * 1.001
+    window = 300.0
+
+    probs = []
+    for alpha in (0.25, 0.5, 0.75, 0.9):
+        left = window * (1.0 - alpha)
+        p_end = m.model_probability(s, k, left, 0.5, 0.0)
+        p_twap = twap_probability(s, k, left, 0.5, alpha=alpha, realized_avg=avg)
+        assert p_twap > p_end, f"alpha={alpha}: {p_twap} <= {p_end}"
+        probs.append(p_twap)
+    assert probs == sorted(probs)          # монотонно растёт с alpha
+
+
+def test_twap_locked_average_dominates_current_spot():
+    """
+    Набранный TWAP далеко выше страйка => вероятность ~1 независимо от
+    текущего спота (реализованную часть уже не отменить).
+    """
+    from src.fair_value import twap_probability
+
+    k = 100_000.0
+    # Спот обвалился ниже страйка, но 90% окна среднее было на 2% выше.
+    p = twap_probability(k * 0.99, k, 30.0, 0.5, alpha=0.9,
+                         realized_avg=k * 1.02)
+    assert p > 0.99
+    # K_eff <= 0: даже нулевые будущие цены не спасут NO — ровно 1.
+    p_locked = twap_probability(k * 0.5, k, 30.0, 0.5, alpha=0.9,
+                                realized_avg=k * 1.15)
+    assert p_locked == 1.0
+
+
+def test_realized_twap_step_integration_and_coverage():
+    from src.fair_value import RealizedTwap
+
+    acc = RealizedTwap(start_ts=100.0, end_ts=400.0)
+    acc.update(100.0, 98.0)      # тик ДО старта окна: держится до старта
+    acc.update(100.0, 100.0)
+    acc.update(200.0, 110.0)     # 10 секунд по 100
+    alpha, avg = acc.state(120.0)  # ещё 10 секунд по 200
+    assert alpha == pytest.approx(20.0 / 300.0)
+    assert avg == pytest.approx(150.0)
+
+    # За концом окна интеграл не растёт, alpha зажат единицей.
+    acc.update(500.0, 390.0)
+    alpha_end, avg_end = acc.state(1000.0)
+    assert alpha_end == 1.0
+    assert 100.0 < avg_end < 500.0
+
+    # Начало окна не покрыто — реализованная часть неизвестна: None.
+    late = RealizedTwap(start_ts=100.0, end_ts=400.0)
+    late.update(100.0, 130.0)    # первый тик через 30 секунд после старта
+    assert late.state(200.0) is None
+
+
+def test_realized_twap_before_window_start_is_alpha_zero():
+    from src.fair_value import RealizedTwap
+
+    acc = RealizedTwap(start_ts=100.0, end_ts=400.0)
+    acc.update(123.0, 50.0)
+    state = acc.state(90.0)
+    assert state is not None
+    alpha, last = state
+    assert alpha == 0.0 and last == 123.0
+
+
+def test_implied_strike_twap_roundtrip():
+    """Инверсия и прямая модель согласованы: K(p) -> p с точностью округления."""
+    from src.fair_value import implied_strike_twap, twap_probability
+
+    s, sigma, left = 109_500.0, 0.55, 180.0
+    alpha, avg = 0.4, 109_480.0
+    for p0 in (0.25, 0.5, 0.62, 0.8):
+        k = implied_strike_twap(s, p0, left, sigma, alpha=alpha, realized_avg=avg)
+        assert k is not None
+        p_back = twap_probability(s, float(k), left, sigma,
+                                  alpha=alpha, realized_avg=avg)
+        assert p_back == pytest.approx(p0, abs=1e-3)
