@@ -41,6 +41,9 @@ class StratCfg:
     allow_directional = True
     directional_min_edge = D("0.025")
     directional_max_net = D("60")
+    ladder_levels = 1
+    ladder_step_ticks = 2
+    ladder_level_size = D("0")
     regime_trending_response = False  # дефолт конфига: вердикт измерения
     regime_volatile_no_quote = True
     trending_crowded_extra_ticks = 3
@@ -970,3 +973,141 @@ def test_vol_estimator_rejects_interval_below_ma_window():
     with pytest.raises(ValueError):
         VolatilityEstimator(600.0, 8.0, 0.30, sample_interval_s=30.0,
                             ma_window_s=60.0)
+
+
+# ---------------------------------------------------------------- лестница
+
+
+class LadderCfg(StratCfg):
+    target_pair_cost = D("0.97")
+    ladder_levels = 5
+    ladder_step_ticks = 2
+    ladder_level_size = D("15")
+
+
+def _fv_at(mid: str, seconds_left: int = 300) -> FairValue:
+    m = FairValueModel(D("0.35"), D("0.3"), D("0.15"))
+    return m.compute(
+        spot=100_000, strike=100_000, seconds_left=seconds_left,
+        market_mid=D(mid), sigma_annual=0.5, drift_per_second=0.0, vol_ready=True,
+    )
+
+
+def test_ladder_levels_descend_by_step_and_keep_pair_invariant(market, books):
+    """
+    Лестница: уровень 0 — цена одиночной котировки, каждый следующий на
+    ladder_step_ticks тиков дальше от mid, размер уровня — ladder_level_size.
+    ГЛАВНЫЙ ИНВАРИАНТ распространяется на ЛЮБУЮ пару уровней: YES_i + NO_j +
+    комиссия < max_pair_cost, потому что глубже — только дешевле.
+    """
+    q = QuoteGenerator(LadderCfg(), RiskCfg())
+    yes_book, no_book = books
+    pos = MarketPosition("0xcond")
+    for mid in ("0.20", "0.35", "0.50", "0.65", "0.85"):
+        quotes = q.build_quotes(market, _fv_at(mid), pos, yes_book, no_book)
+        if not quotes:
+            continue
+        yes = sorted((x for x in quotes if x.outcome == "YES"), key=lambda x: x.level)
+        no = sorted((x for x in quotes if x.outcome == "NO"), key=lambda x: x.level)
+        assert len(yes) == 5 and len(no) == 5, mid
+        for legs in (yes, no):
+            assert [x.level for x in legs] == [0, 1, 2, 3, 4]
+            for a, b in zip(legs, legs[1:]):
+                assert a.price - b.price == D("0.02")   # шаг 2 тика по 0.01
+            # Размер уровня — ladder_level_size с обычными поправками
+            # (directional x1.25/x0.8), одинаковый на всех уровнях стороны.
+            assert len({x.size for x in legs}) == 1
+            assert legs[0].size in {D("15.00"), D("18.75"), D("12.00")}
+            assert all(x.side == "BUY" for x in legs)
+        for y in yes:
+            for n in no:
+                total = y.price + n.price + market.fee_per_pair(y.price, n.price)
+                assert total < LadderCfg.max_pair_cost, (mid, y.level, n.level, total)
+        # Ключи дедупликации различают уровни: N уровней = N разных ордеров.
+        assert len({x.key() for x in quotes}) == len(quotes)
+
+
+def test_ladder_of_one_level_is_the_single_quote(market, books):
+    """ladder_levels=1 — ровно прежние две котировки, размер order_size."""
+    single = QuoteGenerator(StratCfg(), RiskCfg())
+
+    class OneLevel(LadderCfg):
+        ladder_levels = 1
+        target_pair_cost = StratCfg.target_pair_cost
+
+    ladder = QuoteGenerator(OneLevel(), RiskCfg())
+    yes_book, no_book = books
+    pos = MarketPosition("0xcond")
+    fv = _fv_at("0.50")
+    a = single.build_quotes(market, fv, pos, yes_book, no_book)
+    b = ladder.build_quotes(market, fv, pos, yes_book, no_book)
+    assert [(x.outcome, x.price, x.size, x.level) for x in a] == \
+        [(x.outcome, x.price, x.size, x.level) for x in b]
+    assert len(a) == 2 and all(x.level == 0 for x in a)
+
+
+def test_ladder_level_size_zero_means_order_size(market, books):
+    class Cfg(LadderCfg):
+        ladder_level_size = D("0")
+
+    q = QuoteGenerator(Cfg(), RiskCfg())
+    yes_book, no_book = books
+    quotes = q.build_quotes(market, _fv_at("0.50"), MarketPosition("0xcond"), yes_book, no_book)
+    assert quotes and all(x.size == StratCfg.order_size for x in quotes)
+
+
+def test_ladder_drops_levels_below_one_tick(market):
+    """Уровень, ушедший ниже одного тика, не ставится — глубже цены нет."""
+    class Deep(LadderCfg):
+        ladder_levels = 8
+        ladder_step_ticks = 3
+
+    q = QuoteGenerator(Deep(), RiskCfg())
+    # Книга у нижнего края: YES ~0.12 — лестница из 8 уровней по 3¢ уходит
+    # ниже нуля после четвёртого уровня.
+    yes = Book(
+        token_id="tok_yes",
+        bids=[BookLevel(D("0.12"), D("100"))],
+        asks=[BookLevel(D("0.14"), D("100"))],
+        updated_at=time.time(),
+    )
+    no = Book(
+        token_id="tok_no",
+        bids=[BookLevel(D("0.86"), D("100"))],
+        asks=[BookLevel(D("0.88"), D("100"))],
+        updated_at=time.time(),
+    )
+    quotes = q.build_quotes(market, _fv_at("0.13"), MarketPosition("0xcond"), yes, no)
+    yes_levels = [x for x in quotes if x.outcome == "YES"]
+    no_levels = [x for x in quotes if x.outcome == "NO"]
+    assert 0 < len(yes_levels) < 8
+    assert all(x.price >= market.tick_size for x in yes_levels)
+    assert len(no_levels) == 8   # у верхней стороны места хватает
+
+
+def test_ladder_config_cross_validation():
+    """Кросс-валидация: лестница обязана помещаться в лимиты риска."""
+    from src.config import RiskSettings, Settings, StrategySettings
+
+    class Bundle:
+        def __init__(self, strategy, risk) -> None:
+            self.strategy, self.risk = strategy, risk
+
+    ok = Bundle(StrategySettings(ladder_levels=5, ladder_level_size=D("15"),
+                                 max_concurrent_markets=2),
+                RiskSettings(max_open_orders=20))
+    Settings._validate_cross(ok)  # type: ignore[arg-type]
+
+    too_deep = Bundle(StrategySettings(ladder_levels=20, ladder_level_size=D("15")),
+                      RiskSettings(max_position_per_side=D("250"), max_open_orders=200))
+    with pytest.raises(ValueError, match="RISK_MAX_POSITION_PER_SIDE"):
+        Settings._validate_cross(too_deep)  # type: ignore[arg-type]
+
+    too_many = Bundle(StrategySettings(ladder_levels=6, max_concurrent_markets=4),
+                      RiskSettings(max_open_orders=16, max_position_per_side=D("250")))
+    with pytest.raises(ValueError, match="RISK_MAX_OPEN_ORDERS"):
+        Settings._validate_cross(too_many)  # type: ignore[arg-type]
+
+    bad = Bundle(StrategySettings(ladder_levels=0), RiskSettings())
+    with pytest.raises(ValueError, match="STRAT_LADDER"):
+        Settings._validate_cross(bad)  # type: ignore[arg-type]

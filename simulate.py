@@ -68,6 +68,9 @@ class SimStrat:
     allow_directional = True
     directional_min_edge = D("0.025")
     directional_max_net = D("60")
+    ladder_levels = 1
+    ladder_step_ticks = 2
+    ladder_level_size = D("0")
     regime_trending_response = True
     regime_volatile_no_quote = True
     trending_crowded_extra_ticks = 3
@@ -241,7 +244,14 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             use_regime: bool = False, use_unwind: bool = True,
             max_net: float | None = None,
             resolution: str = "twap",
-            reward: RewardParams | None = None) -> dict:
+            reward: RewardParams | None = None,
+            pair_cost: float | None = None,
+            ladder_levels: int = 1,
+            ladder_step_ticks: int = 2,
+            ladder_size: float = 0.0,
+            directional_max_net: float | None = None,
+            max_position: float | None = None,
+            market_model: str = "twap") -> dict:
     """
     Одно торговое окно.
 
@@ -250,6 +260,14 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     модель конечной точки — для сравнительных прогонов).
     reward: параметры программы ликвидити-наград; None — награды не
     моделируются (reward_pnl == 0, метрики пригодности не считаются).
+    pair_cost / ladder_* / directional_max_net / max_position: параметры
+    котирования и лимитов «как у наблюдаемого мейкера» (см. README);
+    None/0 — дефолты SimStrat/SimRisk.
+    market_model: чем рынок ценит исход. 'twap' — тем же средним, что и
+    резолюция (рынок эффективен, у модели нет преимущества); 'endpoint' —
+    ГИПОТЕЗА: розница ценит конечную цену, хотя резолюция по среднему, и
+    TWAP-модель видит расхождение. Коэффициентов не вводит — обе модели
+    уже есть в коде; проверяется по живым логам (mid против model).
     """
     # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
     # seed и разной toxicity получают одинаковые базовую траекторию спота,
@@ -265,7 +283,20 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     rng_queue = random.Random(seed * 8 + 2)    # лотерея очереди исполнения
     rng_tox = random.Random(seed * 8 + 3)      # триггер и величина шока
     rng_trend = random.Random(seed * 8 + 4)    # назначение и направление тренда
-    quoter = QuoteGenerator(SimStrat(), SimRisk())
+    strat = SimStrat()
+    if pair_cost is not None:
+        strat.target_pair_cost = D(str(pair_cost))
+    strat.ladder_levels = int(ladder_levels)
+    strat.ladder_step_ticks = int(ladder_step_ticks)
+    strat.ladder_level_size = D(str(ladder_size))
+    if directional_max_net is not None:
+        strat.directional_max_net = D(str(directional_max_net))
+    risk = SimRisk()
+    if max_position is not None:
+        risk.max_position_per_side = D(str(max_position))
+    if max_net is not None:
+        risk.max_net_exposure = D(str(max_net))
+    quoter = QuoteGenerator(strat, risk)
     fvm = FairValueModel(D("0.35"), D("0.30"), D("0.15"))
     vol = VolatilityEstimator(45.0, 8.0, 0.30)
     # Детектор режима работает на виртуальном времени симуляции (секунды
@@ -328,8 +359,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     # Лимиты как в связке конфигов реального бота: кросс-валидация требует
     # directional_max_net <= max_net_exposure, поэтому при свипе лимита
     # порог разгрузки едет вместе с ним.
-    net_cap = float(max_net) if max_net is not None else float(SimRisk.max_net_exposure)
-    unwind_limit_base = min(float(SimStrat.directional_max_net), net_cap)
+    net_cap = float(risk.max_net_exposure)
+    unwind_limit_base = min(float(strat.directional_max_net), net_cap)
 
     fills = 0
     unwound = 0.0
@@ -367,7 +398,13 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             )
         else:
             p_true = true_probability(spot, strike, left, sigma)
-        p_mkt = min(0.97, max(0.03, p_true + rng_market.gauss(0, market_noise)))
+        if market_model == "endpoint" and twap_acc is not None:
+            # Гипотеза «розница ценит конечную точку»: рынок стоит по
+            # endpoint-вероятности, резолюция и наша модель — по среднему.
+            p_priced = true_probability(spot, strike, left, sigma)
+        else:
+            p_priced = p_true
+        p_mkt = min(0.97, max(0.03, p_priced + rng_market.gauss(0, market_noise)))
 
         yes_book = make_book(p_mkt, market_spread)
         no_book = make_book(1 - p_mkt, market_spread)
@@ -388,7 +425,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         if use_unwind:
             unwind_limit = unwind_limit_base
             if left < 60:
-                unwind_limit = min(unwind_limit, float(SimStrat.order_size))
+                unwind_limit = min(unwind_limit, float(strat.order_size))
             if abs(float(pos.net)) > unwind_limit:
                 book = yes_book if pos.net > 0 else no_book
                 quotes = quoter.build_unwind_quotes(market, pos, book) or None
@@ -465,7 +502,7 @@ def run_one(window_s: int, sigma: float, market_noise: float,
                     spot *= math.exp(shock * 8 if q.outcome == "YES" else -shock * 8)
                 continue
 
-            if side_size + q.size > float(SimRisk.max_position_per_side):
+            if side_size + q.size > float(risk.max_position_per_side):
                 continue
             if abs(pos.net) >= net_cap:
                 # Разрешаем только сокращающую сторону.
@@ -550,6 +587,10 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         "reward_miss_unwind": reward_miss["unwind"] / reward_samples if reward_samples else 0.0,
         "reward_miss_other": reward_miss["other"] / reward_samples if reward_samples else 0.0,
         "fills": fills,
+        # PnL на одну сделку (филл) — сравнивать с наблюдаемыми мейкерами,
+        # у которых известны PnL и число сделок.
+        "pnl_per_fill": (float(pos.realized_pnl) / fills) if fills else 0.0,
+        "shares_per_fill": ((total_bought + unwound) / fills) if fills else 0.0,
         "merged": float(pos.merged_pairs),
         "residual_net": float(pos.net),
         "abs_residual": abs(float(pos.net)),
@@ -585,7 +626,9 @@ def run_level(
         (args.window, args.sigma, args.noise, args.spread, seed,
          toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas),
          args.trend_prob, args.trend_strength, use_regime, use_unwind, max_net,
-         args.resolution, reward)
+         args.resolution, reward, args.pair_cost, args.ladder_levels,
+         args.ladder_step, args.ladder_size, args.directional_max_net,
+         args.max_position, args.market_model)
         for seed in range(args.runs)
     ]
     if args.jobs > 1:
@@ -635,6 +678,17 @@ def reward_stats(results: list[dict]) -> str:
             f"для нуля нужен пул рынка ≥ {needed:6.2f} USDC при этой доле")
 
 
+def fills_stats(results: list[dict]) -> str:
+    """PnL на сделку по группе окон: суммарный PnL / суммарные филлы."""
+    total_fills = sum(r["fills"] for r in results)
+    if total_fills == 0:
+        return "нет сделок"
+    per_fill = sum(r["pnl"] for r in results) / total_fills
+    shares = sum(r["shares_per_fill"] * r["fills"] for r in results) / total_fills
+    return (f"{per_fill:+.3f} USDC ({per_fill / shares * 100:+.2f}¢/share при "
+            f"{shares:.1f} shares/сделка, {total_fills / len(results):.1f} сделок/окно)")
+
+
 def group_stats(results: list[dict]) -> str:
     """Однострочная сводка группы окон: PnL, доля пар, непарный остаток."""
     if not results:
@@ -678,6 +732,7 @@ def print_level_report(results: list[dict]) -> None:
     print(f"Худшее окно         : {min(pnls):+.3f}")
     print(f"Лучшее окно         : {max(pnls):+.3f}")
     print(f"Филлов за окно      : {statistics.mean(fills):.1f}")
+    print(f"PnL на сделку (филл): {fills_stats(results)}")
     print(f"Смержено пар        : {statistics.mean(merged):.1f}")
     print(f"Доля shares в парах : {statistics.mean([r['pair_rate'] for r in results]):.1%}")
     print(f"Средний |остаток|   : {statistics.mean([r['abs_residual'] for r in results]):.1f} shares")
@@ -706,7 +761,8 @@ def run_sweep(args, levels: list[float]) -> None:
             sum(1 for p in per_level[level] if p > 0), len(per_level[level])
         )
         print(f"toxicity {level:4.2f} | PnL {mean:+7.2f} ± {half:.2f} | "
-              f"прибыльных {wins:.1%} ± {win_half:.1%}")
+              f"прибыльных {wins:.1%} ± {win_half:.1%} | "
+              f"на сделку {fills_stats(results)}")
         if reward_params_from_args(args) is not None:
             print(f"  {reward_stats(results)}")
         print_trend_split(results)
@@ -944,6 +1000,23 @@ def main() -> None:
     ap.add_argument("--reward-c", type=float, default=3.0,
                     help="in-game multiplier формулы наград (для крипто в docs "
                          "не назван — НЕ проверен)")
+    ap.add_argument("--pair-cost", type=float, default=None,
+                    help="целевая сумма пары (target_pair_cost); дефолт 0.985. "
+                         "Наблюдаемый мейкер: 0.96-0.98")
+    ap.add_argument("--ladder-levels", type=int, default=1,
+                    help="уровней лестницы на сторону (1 = одна котировка)")
+    ap.add_argument("--ladder-step", type=int, default=2,
+                    help="шаг лестницы в тиках")
+    ap.add_argument("--ladder-size", type=float, default=0.0,
+                    help="размер уровня лестницы, shares (0 = order_size)")
+    ap.add_argument("--directional-max-net", type=float, default=None,
+                    help="STRAT_DIRECTIONAL_MAX_NET — порог разгрузки; "
+                         "дефолт 60, не выше --max-net")
+    ap.add_argument("--max-position", type=float, default=None,
+                    help="RISK_MAX_POSITION_PER_SIDE; дефолт 250")
+    ap.add_argument("--market-model", choices=["twap", "endpoint"], default="twap",
+                    help="чем рынок ценит исход: twap — как резолюция (дефолт); "
+                         "endpoint — ГИПОТЕЗА отставания розницы (см. README)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="процессов для параллельного прогона")
     args = ap.parse_args()
@@ -975,7 +1048,11 @@ def main() -> None:
     print(f"Прогонов: {args.runs} | окно {args.window}s | sigma {args.sigma} | "
           f"toxicity {args.toxicity} | queue {args.queue} | "
           f"комиссия {args.fee_rate} | газ merge {args.merge_gas} | "
-          f"тренд {args.trend_prob}/{args.trend_strength}σ")
+          f"тренд {args.trend_prob}/{args.trend_strength}σ | "
+          f"пара {args.pair_cost or SimStrat.target_pair_cost} | "
+          f"лестница {args.ladder_levels}x{args.ladder_step}т"
+          f"{'x' + str(args.ladder_size) if args.ladder_size else ''} | "
+          f"рынок={args.market_model}")
     print("-" * 62)
     print_level_report(run_level(args, args.toxicity))
     print("-" * 62)

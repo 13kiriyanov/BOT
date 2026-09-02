@@ -270,3 +270,31 @@ def test_reward_share_is_normalised_over_samples_with_any_score(monkeypatch):
     assert contested["reward_share"] == pytest.approx(0.5 * contested["reward_uptime"])
     assert contested["reward_pnl"] == pytest.approx(5.0 * contested["reward_uptime"])
     assert contested["pnl"] == pytest.approx(alone["pnl"])  # торговля не зависит от наград
+
+
+def test_ladder_and_market_model_flags_change_the_run():
+    """
+    Лестница даёт больше сделок за окно (глубокие уровни собирают проходы
+    цены), сумма пары 0.97 и лимиты выше — параметры наблюдаемого мейкера
+    проходят до quoting; market_model='endpoint' меняет цену рынка при той
+    же резолюции, а market_model='twap' с лестницей из одного уровня —
+    ровно прежний прогон.
+    """
+    base = run_one(600, 0.55, 0.012, 0.02, 11, 0.35, 0.45, D("0"), D("0.01"),
+                   0.0, 0.0, False, True, 120.0, "twap", None)
+    same = run_one(600, 0.55, 0.012, 0.02, 11, 0.35, 0.45, D("0"), D("0.01"),
+                   0.0, 0.0, False, True, 120.0, "twap", None,
+                   pair_cost=None, ladder_levels=1, market_model="twap")
+    assert same["pnl"] == base["pnl"] and same["fills"] == base["fills"]
+
+    ladder = run_one(600, 0.55, 0.012, 0.02, 11, 0.35, 0.45, D("0"), D("0.01"),
+                     0.0, 0.0, False, True, 900.0, "twap", None,
+                     pair_cost=0.97, ladder_levels=5, ladder_step_ticks=2,
+                     ladder_size=20.0, directional_max_net=900.0, max_position=1000.0)
+    assert ladder["fills"] > base["fills"]
+    assert ladder["pnl_per_fill"] == pytest.approx(ladder["pnl"] / ladder["fills"])
+    assert ladder["shares_per_fill"] > 0
+
+    naive = run_one(600, 0.55, 0.012, 0.02, 11, 0.35, 0.45, D("0"), D("0.01"),
+                    0.0, 0.0, False, True, 120.0, "twap", None, market_model="endpoint")
+    assert (naive["pnl"], naive["fills"]) != (base["pnl"], base["fills"])
