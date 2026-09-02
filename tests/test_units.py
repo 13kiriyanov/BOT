@@ -427,3 +427,53 @@ def test_order_book_levels_are_human_units_best_is_last():
     assert "self.bids[-1]" in src and "self.asks[-1]" in src
     sig = inspect.signature(AsyncPublicClient.get_order_book)
     assert sig.parameters["token_id"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_clob_rewards_models_and_endpoints_shape():
+    """
+    Награды по CLOB (diag.py): list_current_rewards() -> /rewards/markets/
+    current, list_market_rewards(condition_id=...) -> /rewards/markets/{cid};
+    оба — ПАГИНАТОРЫ (iter_items). rate_per_day — USDC/день (Decimal),
+    даты — epoch-миллисекунды -> datetime UTC. Именно эти ставки отвечают
+    на вопрос «активна ли программа», когда Gamma clobRewards пуст.
+    """
+    import inspect
+    from datetime import UTC
+
+    from polymarket import AsyncPublicClient
+    from polymarket._internal.actions import rewards as actions
+    from polymarket.models.clob.rewards import CurrentReward, MarketReward
+
+    cid = "0x" + "ab" * 32
+    cur = CurrentReward.model_validate({
+        "condition_id": cid, "rewards_max_spread": 3.5, "rewards_min_size": "20",
+        "rewards_config": [{"asset_address": "0xusdc", "start_date": 1756684800000,
+                            "end_date": None, "rate_per_day": "33.6",
+                            "total_rewards": "1000"}],
+        "sponsored_daily_rate": "0", "native_daily_rate": "33.6",
+        "total_daily_rate": "33.6", "sponsors_count": 0,
+    })
+    assert cur.rewards_config[0].rate_per_day == Decimal("33.6")
+    assert cur.rewards_config[0].start_date.tzinfo is UTC
+    assert cur.rewards_config[0].end_date is None
+    assert cur.total_daily_rate == Decimal("33.6")
+
+    mkt = MarketReward.model_validate({
+        "condition_id": cid, "question": "Bitcoin Up or Down?",
+        "market_slug": "btc-updown-5m-1788276000", "rewards_max_spread": 3.5,
+        "rewards_min_size": "20", "market_competitiveness": 1.7,
+        "tokens": [{"token_id": "111", "outcome": "Up", "price": "0.51"}],
+        "rewards_config": [{"asset_address": "0xusdc", "start_date": "1756684800000",
+                            "end_date": "1759276800000", "rate_per_day": 33.6}],
+    })
+    assert mkt.rewards_config[0].rate_per_day == Decimal("33.6")
+    assert mkt.tokens[0].price == Decimal("0.51")
+
+    path, _ = actions.build_list_current_rewards_request()
+    assert path == "/rewards/markets/current"
+    path, _ = actions.build_list_market_rewards_request(condition_id=cid)
+    assert path == f"/rewards/markets/{cid}"
+    sig = inspect.signature(AsyncPublicClient.list_market_rewards)
+    assert sig.parameters["condition_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert hasattr(AsyncPublicClient, "list_current_rewards")
+    assert hasattr(AsyncPublicClient, "get_order_book")
