@@ -60,6 +60,23 @@ def normalize_rtds_symbol(symbol: str) -> str:
     return symbol.replace("/", "").replace("-", "").replace("_", "").upper()
 
 
+def asset_for_symbol(symbol: str) -> str | None:
+    """
+    Наш актив по wire-символу; None — ЧУЖОЙ символ (zec/usd, sol/usd, ...).
+
+    Топиковая подписка приносит ВСЕ активы потока — в SpotFeed имеют право
+    попасть только BTC и ETH. Всё, что вернуло None, отбрасывается до
+    ingest(): чужая цена, скормленная модели BTC/ETH, ломает fair молча.
+    """
+    return POLY_SYMBOLS.get(normalize_rtds_symbol(symbol))
+
+
+# Активы, тики которых фид ОБЯЗАН отдавать; отсутствие любого из них через
+# FEED_ASSETS_WARN_AFTER_S после подключения — WARNING в лог.
+EXPECTED_ASSETS = ("BTC", "ETH")
+FEED_ASSETS_WARN_AFTER_S = 30.0
+
+
 class SpotFeed:
     """Держит последнюю цену и волатильность по каждому активу."""
 
@@ -76,12 +93,30 @@ class SpotFeed:
         # Подписчики на каждый тик (движок кормит ими детектор режима).
         self._listeners: list[Callable[[str, float, float], None]] = []
         self._cfg = (vol_halflife_s, momentum_halflife_s, float(vol_floor_annual))
+        # Kwargs оценщика под источник: пустые = тиковый режим (Binance).
+        self._est_kwargs: dict = {}
         self._stop = asyncio.Event()
 
     def _est(self, asset: str) -> VolatilityEstimator:
         if asset not in self._vol:
-            self._vol[asset] = VolatilityEstimator(*self._cfg)
+            self._vol[asset] = VolatilityEstimator(*self._cfg, **self._est_kwargs)
         return self._vol[asset]
+
+    def _use_resolution_feed_estimators(self) -> None:
+        """
+        Перевести оценщики в режим сглаженного ряда (поток Chainlink TWAP-60):
+        лаг-выборка 60с + поправка скользящего среднего, полупериод EWMA
+        растянут под редкие сэмплы (45с при выборке раз в 60с означал бы
+        полную замену дисперсии каждым сэмплом). Готовность — 12 сэмплов
+        (~12 минут фида); до неё модель живёт на floor-подмешанной sigma.
+        Вызывается run_polymarket ДО первого ingest.
+        """
+        self._est_kwargs = dict(
+            sample_interval_s=60.0, ma_window_s=60.0, ready_samples=12,
+        )
+        vol_halflife_s, momentum_halflife_s, vol_floor = self._cfg
+        self._cfg = (max(vol_halflife_s, 600.0), momentum_halflife_s, vol_floor)
+        self._vol.clear()
 
     # ------------------------------------------------------------------ API
 
@@ -130,9 +165,16 @@ class SpotFeed:
         # по докстрингу SDK — нижний регистр со слэшем ('btc/usd'), их
         # покрывает normalize_rtds_symbol; фильтрация на нашей стороне.
         spec = CryptoPricesChainlinkTwapSpec(window_seconds=60)
+        self._use_resolution_feed_estimators()
         backoff = 1.0
-        first_tick_logged = False
-        unmatched_seen: set[str] = set()
+        # Живое доказательство покрытия: первый тик логируется ПО КАЖДОМУ
+        # нужному активу отдельно. Один общий «первый тик» врал: топиковая
+        # подписка начинается с чужого символа (вживую — zec/usd), строка
+        # выглядела как жизнь фида, а BTC/ETH могли не прийти вовсе.
+        assets_seen: set[str] = set()
+        foreign_seen: set[str] = set()
+        missing_warned = False
+        connected_at: float | None = None
         while not self._stop.is_set():
             try:
                 log.info(
@@ -142,6 +184,7 @@ class SpotFeed:
                 # subscribe() — корутина: await возвращает handle-CM.
                 async with await client.subscribe(spec) as stream:
                     backoff = 1.0
+                    connected_at = time.time()
                     async for event in stream:
                         if self._stop.is_set():
                             break
@@ -157,20 +200,46 @@ class SpotFeed:
                         window = getattr(payload, "window_seconds", None)
                         if window is not None and window != 60:
                             continue
-                        if not first_tick_logged:
-                            # Живое доказательство формата символа по проводу.
-                            first_tick_logged = True
-                            log.info(
-                                "Крипто-фид жив: первый тик symbol=%r value=%s",
-                                symbol, value,
-                            )
-                        norm = normalize_rtds_symbol(str(symbol))
-                        asset = POLY_SYMBOLS.get(norm)
-                        if asset:
+
+                        # ФИЛЬТР АКТИВОВ — до любых логов и ingest: в
+                        # SpotFeed попадают только BTC/ETH, чужие символы
+                        # отбрасываются (DEBUG один раз на символ).
+                        asset = asset_for_symbol(str(symbol))
+                        if asset is None:
+                            norm = normalize_rtds_symbol(str(symbol))
+                            if norm not in foreign_seen:
+                                foreign_seen.add(norm)
+                                log.debug(
+                                    "Крипто-фид: чужой символ %r — пропускаю",
+                                    symbol,
+                                )
+                        else:
+                            if asset not in assets_seen:
+                                assets_seen.add(asset)
+                                log.info(
+                                    "Фид резолюции: первый тик %s "
+                                    "(symbol=%r value=%s)", asset, symbol, value,
+                                )
                             self.ingest(asset, float(value))
-                        elif norm not in unmatched_seen:
-                            unmatched_seen.add(norm)
-                            log.debug("Крипто-фид: чужой символ %r — пропускаю", symbol)
+
+                        # Фид «жив», но нужного актива нет — это не жизнь.
+                        if (
+                            not missing_warned
+                            and connected_at is not None
+                            and time.time() - connected_at > FEED_ASSETS_WARN_AFTER_S
+                        ):
+                            missing = [
+                                a for a in EXPECTED_ASSETS if a not in assets_seen
+                            ]
+                            missing_warned = True
+                            if missing:
+                                log.warning(
+                                    "Фид резолюции жив (%d чужих символов), но за "
+                                    "%.0fс НЕТ тиков по: %s — их модели останутся "
+                                    "без цены и торговаться не будут",
+                                    len(foreign_seen), FEED_ASSETS_WARN_AFTER_S,
+                                    ", ".join(missing),
+                                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - фид не должен ронять бота

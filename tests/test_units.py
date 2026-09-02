@@ -300,10 +300,17 @@ def test_crypto_prices_payload_shape_and_filter_contract():
     assert exact_filter(ev) is False
     assert matcher_for(spec_wide)(ev) is True
 
-    from src.price_feed import POLY_SYMBOLS, normalize_rtds_symbol
+    from src.price_feed import asset_for_symbol
 
     for wire in ("btc/usd", "BTC/USD", "btcusdt", "BTC/USDT", "btc-usdt"):
-        assert POLY_SYMBOLS[normalize_rtds_symbol(wire)] == "BTC", wire
+        assert asset_for_symbol(wire) == "BTC", wire
+    for wire in ("eth/usd", "ETH/USDT"):
+        assert asset_for_symbol(wire) == "ETH", wire
+    # Отбор — часть контракта: топиковая подписка приносит ВСЕ активы
+    # потока, и любой чужой символ обязан давать None (вживую zec/usd
+    # оказался первым событием подписки).
+    for foreign in ("zec/usd", "sol/usd", "doge/usd", "xrp/usdt", "btc/eur"):
+        assert asset_for_symbol(foreign) is None, foreign
 
 
 # ------------------------------------- market-стрим: book / price_change

@@ -919,3 +919,54 @@ def test_implied_strike_twap_roundtrip():
         p_back = twap_probability(s, float(k), left, sigma,
                                   alpha=alpha, realized_avg=avg)
         assert p_back == pytest.approx(p0, abs=1e-3)
+
+
+def test_vol_estimator_recovers_sigma_of_smoothed_series():
+    """
+    Наивная EWMA по секундным тикам SMA-60 занижает sigma в разы: модель
+    насыщается в 0/1, fair прилипает к клипу max_model_deviation (вживую:
+    fair=0.3132 при mid 0.46 — ровно mid − 0.15). Лаг-выборка 60с с
+    поправкой скользящего среднего восстанавливает масштаб.
+    """
+    import math
+    import random
+
+    rng = random.Random(5)
+    sigma_true = 0.55
+    year = 365 * 24 * 3600
+    spot = 109_500.0
+    window: list[float] = []
+
+    naive = VolatilityEstimator(45.0, 8.0, 0.30)
+    fixed = VolatilityEstimator(600.0, 8.0, 0.30, sample_interval_s=60.0,
+                                ma_window_s=60.0, ready_samples=12)
+    for t in range(4000):
+        spot *= math.exp(sigma_true * math.sqrt(1 / year) * rng.gauss(0, 1))
+        window.append(spot)
+        if len(window) > 60:
+            window.pop(0)
+        sma = sum(window) / len(window)
+        if t >= 60:
+            naive.update(sma, float(t))
+            fixed.update(sma, float(t))
+
+    assert naive.sigma_annual < 0.2, "наивная оценка должна занижать в разы"
+    assert 0.40 < fixed.sigma_annual < 0.75, fixed.sigma_annual
+    assert fixed.ready                      # ~65 сэмплов при пороге 12
+
+    # Симптом вживую: с наивной sigma модель насыщена, с исправленной — нет.
+    from src.fair_value import twap_probability
+
+    k = 109_500.0
+    saturated = twap_probability(k * 0.999, k, 200.0, naive.sigma_annual,
+                                 alpha=1 / 3, realized_avg=k)
+    healthy = twap_probability(k * 0.999, k, 200.0, fixed.sigma_annual,
+                               alpha=1 / 3, realized_avg=k)
+    assert saturated < 0.001
+    assert 0.03 < healthy < 0.45
+
+
+def test_vol_estimator_rejects_interval_below_ma_window():
+    with pytest.raises(ValueError):
+        VolatilityEstimator(600.0, 8.0, 0.30, sample_interval_s=30.0,
+                            ma_window_s=60.0)

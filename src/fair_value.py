@@ -232,7 +232,23 @@ def implied_strike_twap(
 
 
 class VolatilityEstimator:
-    """EWMA-оценка реализованной волатильности и momentum по тикам спота."""
+    """
+    EWMA-оценка реализованной волатильности и momentum по тикам фида.
+
+    ДВА РЕЖИМА, и перепутать их — значит сломать модель молча:
+
+    - sample_interval_s == 0 (несглаженный ряд, Binance-спот): каждый тик,
+      нормировка на sqrt(dt) — классика.
+    - sample_interval_s > 0 (СГЛАЖЕННЫЙ ряд, поток Chainlink TWAP-60):
+      секундные приращения скользящего среднего крошечные и сильно
+      коррелированы — наивная EWMA занижает sigma в разы (на синтетике
+      SMA-60 от GBM с sigma=0.55 наивная оценка даёт 0.075, x0.14), модель
+      насыщается в 0/1 и fair прилипает к клипу max_model_deviation.
+      Лечение: берём приращения только на лаге >= sample_interval_s и
+      восстанавливаем масштаб поправкой скользящего среднего — для ряда
+      SMA(W) дисперсия лаг-L приращения равна sigma^2*(L - W/3), а не
+      sigma^2*L, поэтому норму делим на sqrt(1 - W/(3L)).
+    """
 
     __slots__ = (
         "_vol_lambda",
@@ -243,6 +259,10 @@ class VolatilityEstimator:
         "_last_ts",
         "_samples",
         "_vol_floor",
+        "_sample_interval",
+        "_ma_window",
+        "_ready_samples",
+        "_blend_samples",
     )
 
     def __init__(
@@ -250,6 +270,10 @@ class VolatilityEstimator:
         vol_halflife_s: float,
         momentum_halflife_s: float,
         vol_floor_annual: float,
+        *,
+        sample_interval_s: float = 0.0,
+        ma_window_s: float = 0.0,
+        ready_samples: int = 20,
     ) -> None:
         # EWMA-коэффициент из полупериода: lambda = exp(-ln2 / halflife)
         self._vol_lambda = math.exp(-math.log(2.0) / max(vol_halflife_s, 1e-6))
@@ -260,9 +284,15 @@ class VolatilityEstimator:
         self._last_ts: float | None = None
         self._samples: int = 0
         self._vol_floor = vol_floor_annual
+        if 0 < sample_interval_s < ma_window_s:
+            raise ValueError("интервал выборки должен быть >= окна сглаживания")
+        self._sample_interval = sample_interval_s
+        self._ma_window = ma_window_s
+        self._ready_samples = max(ready_samples, 2)
+        self._blend_samples = max(3 * self._ready_samples, 10)
 
     def update(self, price: float, ts: float | None = None) -> None:
-        """Скормить новый тик спот-цены."""
+        """Скормить новый тик цены фида."""
         ts = ts if ts is not None else time.time()
         if price <= 0:
             return
@@ -271,20 +301,30 @@ class VolatilityEstimator:
             return
 
         dt = max(ts - self._last_ts, 1e-3)
-        # Игнорируем дубликаты и слишком старые тики.
-        if dt > 30.0:
+        # Лаг-выборка сглаженного ряда: тики чаще интервала ПРОПУСКАЕМ, не
+        # сдвигая якорь — иначе снова меряем микроприращения среднего.
+        if self._sample_interval > 0 and dt < self._sample_interval:
+            return
+        # Игнорируем дубликаты и слишком старые тики; порог масштабируется
+        # интервалом выборки.
+        if dt > max(30.0, self._sample_interval * 4):
             self._last_price, self._last_ts = price, ts
             return
 
         ret = math.log(price / self._last_price)
         # Нормируем на sqrt(dt) — приводим к дисперсии за 1 секунду.
         norm_ret = ret / math.sqrt(dt)
+        # Поправка скользящего среднего (см. докстринг класса).
+        if self._ma_window > 0 and dt >= self._ma_window:
+            norm_ret /= math.sqrt(1.0 - self._ma_window / (3.0 * dt))
 
         # Адаптивный коэффициент: учитываем реальный интервал между тиками.
         lam_v = self._vol_lambda**dt
         lam_m = self._mom_lambda**dt
 
         self._var = lam_v * self._var + (1.0 - lam_v) * (norm_ret**2)
+        # Momentum на лаг-выборке — дрейф за интервал; клип вклада в модели
+        # ограничивает его шум, как и на тиковом режиме.
         self._momentum = lam_m * self._momentum + (1.0 - lam_m) * (ret / dt)
 
         self._last_price, self._last_ts = price, ts
@@ -295,8 +335,8 @@ class VolatilityEstimator:
         """Годовая волатильность."""
         sigma = math.sqrt(max(self._var, 1e-12) * SECONDS_PER_YEAR)
         # Пока мало данных — подмешиваем floor, чтобы не переоценить уверенность.
-        if self._samples < 60:
-            w = self._samples / 60.0
+        if self._samples < self._blend_samples:
+            w = self._samples / float(self._blend_samples)
             sigma = w * sigma + (1.0 - w) * self._vol_floor
         return max(sigma, self._vol_floor * 0.25)
 
@@ -307,7 +347,7 @@ class VolatilityEstimator:
 
     @property
     def ready(self) -> bool:
-        return self._samples >= 20
+        return self._samples >= self._ready_samples
 
     @property
     def samples(self) -> int:
