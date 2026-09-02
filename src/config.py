@@ -102,6 +102,18 @@ class StrategySettings(BaseSettings):
     # мгновенно и сгорает. Наблюдалось вживую: BUY YES @ 0.03 + NO @ 0.94.
     quote_mid_min: Decimal = Decimal("0.10")
     quote_mid_max: Decimal = Decimal("0.90")
+    # --- Лестница котировок --------------------------------------------------
+    # Уровней на сторону. 1 — одна котировка на сторону (прежнее поведение).
+    # Уровень 0 стоит там же, где стояла бы одиночная котировка (с подгонкой
+    # под книгу), каждый следующий — на ladder_step_ticks тиков ДАЛЬШЕ от
+    # mid. Все уровни ниже нулевого, поэтому парный инвариант по лучшим
+    # бидам покрывает любую пару уровней. Наблюдаемый живой мейкер держит
+    # 5-6 уровней на сторону с шагом 1-4 цента по 15-30 shares (README).
+    ladder_levels: int = 1
+    ladder_step_ticks: int = 2
+    # Размер каждого уровня лестницы, shares; 0 = order_size. Действует
+    # только при ladder_levels > 1.
+    ladder_level_size: Decimal = Decimal("0")
     # Сглаживание mid для fair value (полупериод EWMA, сек; 0 = выключено).
     # Микропрайс дёргается каждым тиком стакана, центр котирования скачет
     # на 3-4 тика за пару секунд, и бот бесконечно переставляет ордера,
@@ -351,6 +363,22 @@ class Settings:
             raise ValueError("STRAT_QUOTE_MID_MIN/MAX: нужно 0 <= min < max <= 1")
         if s.fair_mid_smoothing_halflife_s < 0:
             raise ValueError("STRAT_FAIR_MID_SMOOTHING_HALFLIFE_S не может быть < 0")
+        if s.ladder_levels < 1 or s.ladder_step_ticks < 1 or s.ladder_level_size < 0:
+            raise ValueError(
+                "STRAT_LADDER_LEVELS >= 1, STRAT_LADDER_STEP_TICKS >= 1, "
+                "STRAT_LADDER_LEVEL_SIZE >= 0"
+            )
+        level_size = s.ladder_level_size or s.order_size
+        if s.ladder_levels * level_size > r.max_position_per_side:
+            raise ValueError(
+                "Лестница целиком (STRAT_LADDER_LEVELS x размер уровня) больше "
+                "RISK_MAX_POSITION_PER_SIDE: глубокие уровни никогда не встанут"
+            )
+        if 2 * s.ladder_levels * s.max_concurrent_markets > r.max_open_orders:
+            raise ValueError(
+                "2 x STRAT_LADDER_LEVELS x STRAT_MAX_CONCURRENT_MARKETS ордеров "
+                "больше RISK_MAX_OPEN_ORDERS: подними лимит или уменьши лестницу"
+            )
 
 
 def load_settings() -> Settings:

@@ -225,3 +225,79 @@ def test_gtd_ttl_is_clamped_to_exchange_minimum():
         order_ttl_s=0,
     )
     assert gtc.order_ttl_s == 0  # GTC остаётся GTC
+
+
+# ---------------------------------------------------------------- лестница
+
+
+def test_ladder_levels_are_separate_orders_in_reconcile():
+    """
+    Два уровня одной стороны — два разных ордера: ключ (token, side, level).
+    Без уровня в ключе второй уровень «заменял» бы первый, и лестница
+    схлопывалась бы в одну котировку.
+    """
+    from src.models import Quote
+
+    om = make_manager([])
+    tick = D("0.01")
+    ladder = [
+        Quote("tok_yes", "YES", "BUY", D("0.48"), D("15"), level=0),
+        Quote("tok_yes", "YES", "BUY", D("0.46"), D("15"), level=1),
+        Quote("tok_no", "NO", "BUY", D("0.49"), D("15"), level=0),
+        Quote("tok_no", "NO", "BUY", D("0.47"), D("15"), level=1),
+    ]
+    cancelled, placed = asyncio.run(om.reconcile(ladder, tick))
+    assert (cancelled, placed) == (0, 4)
+    assert om.open_count == 4
+    assert {o.level for o in om.live_orders()} == {0, 1}
+
+    # Тот же набор — ничего не переставляется.
+    cancelled, placed = asyncio.run(om.reconcile(ladder, tick))
+    assert (cancelled, placed) == (0, 0)
+
+    # Лестница схлопнулась до одного уровня — глубокие уровни снимаются.
+    cancelled, placed = asyncio.run(om.reconcile(ladder[:1] + ladder[2:3], tick))
+    assert (cancelled, placed) == (2, 0)
+    assert om.open_count == 2 and all(o.level == 0 for o in om.live_orders())
+
+
+def test_sync_open_orders_restores_ladder_levels_by_price():
+    """
+    Биржа уровней не знает: после сверки лучший бид получает уровень 0,
+    следующий — 1 (для асков — наоборот), как у quoting. Иначе после
+    реконнекта все ордера стороны схлопнулись бы в один ключ, и бот
+    поставил бы дубликаты.
+    """
+    from polymarket.pagination import AsyncPaginator, Page
+
+    orders = [
+        Obj(id="o-deep", token_id="tok_yes", side="BUY", price="0.44",
+            original_size="15", size_matched="0"),
+        Obj(id="o-top", token_id="tok_yes", side="BUY", price="0.48",
+            original_size="15", size_matched="0"),
+        Obj(id="o-mid", token_id="tok_yes", side="BUY", price="0.46",
+            original_size="15", size_matched="5"),
+        Obj(id="o-ask", token_id="tok_yes", side="SELL", price="0.60",
+            original_size="10", size_matched="0"),
+        Obj(id="o-ask-best", token_id="tok_yes", side="SELL", price="0.55",
+            original_size="10", size_matched="0"),
+    ]
+
+    class Client:
+        def list_open_orders(self) -> AsyncPaginator:
+            async def fetch(cursor):  # noqa: ANN001
+                idx = int(cursor or 0)
+                has_more = idx + 1 < len(orders)
+                return Page(items=(orders[idx],), has_more=has_more,
+                            next_cursor=str(idx + 1) if has_more else None)
+            return AsyncPaginator(fetch)
+
+    om = OrderManager(Client(), dry_run=False, requote_threshold_ticks=1,
+                      order_ttl_s=0, on_fill=None)  # type: ignore[arg-type]
+    asyncio.run(om.sync_open_orders())
+
+    live = {o.order_id: o for o in om.live_orders()}
+    assert om.open_count == 5
+    assert (live["o-top"].level, live["o-mid"].level, live["o-deep"].level) == (0, 1, 2)
+    assert (live["o-ask-best"].level, live["o-ask"].level) == (0, 1)
+    assert om._by_id["o-mid"] == ("tok_yes", "BUY", 1)

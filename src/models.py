@@ -205,9 +205,13 @@ class Quote:
     side: Side
     price: Decimal
     size: Decimal
+    # Уровень лестницы: 0 — ближайший к mid. Часть ключа дедупликации:
+    # без него второй уровень той же стороны считался бы «тем же ордером»
+    # и лестница схлопывалась бы в одну котировку.
+    level: int = 0
 
-    def key(self) -> tuple[str, Side]:
-        return (self.token_id, self.side)
+    def key(self) -> tuple[str, Side, int]:
+        return (self.token_id, self.side, self.level)
 
 
 @dataclass(slots=True)
@@ -221,6 +225,7 @@ class LiveOrder:
     original_size: Decimal
     size_matched: Decimal = ZERO
     created_at: float = field(default_factory=time.time)
+    level: int = 0                     # уровень лестницы (см. Quote.level)
 
     @property
     def remaining(self) -> Decimal:

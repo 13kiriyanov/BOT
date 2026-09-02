@@ -89,9 +89,9 @@ class OrderManager:
         self.on_fill = on_fill
 
         # (token_id, side) -> LiveOrder
-        self._live: dict[tuple[str, str], LiveOrder] = {}
+        self._live: dict[tuple[str, str, int], LiveOrder] = {}
         # order_id -> (token_id, side) для быстрого поиска при апдейтах.
-        self._by_id: dict[str, tuple[str, str]] = {}
+        self._by_id: dict[str, tuple[str, str, int]] = {}
         # token_id -> condition_id, чтобы филлы попадали в нужную позицию.
         self._token_market: dict[str, str] = {}
         # LRU всех своих order id (живых и недавно снятых) — для атрибуции
@@ -122,8 +122,9 @@ class OrderManager:
         return [o for o in self._live.values() if o.token_id in token_ids]
 
     def _track(self, order: LiveOrder) -> None:
-        self._live[(order.token_id, order.side)] = order
-        self._by_id[order.order_id] = (order.token_id, order.side)
+        key = (order.token_id, order.side, order.level)
+        self._live[key] = order
+        self._by_id[order.order_id] = key
         self._remember_order(order.order_id)
 
     def _remember_order(self, order_id: str) -> None:
@@ -228,11 +229,11 @@ class OrderManager:
                 self._dry_seq += 1
                 oid = f"dry-{self._dry_seq}"
                 self._track(
-                    LiveOrder(oid, q.token_id, q.side, q.price, q.size)
+                    LiveOrder(oid, q.token_id, q.side, q.price, q.size, level=q.level)
                 )
                 log.info(
-                    "[DRY] %s %s %s @ %s (%s)",
-                    q.side, q.outcome, q.size, q.price, q.token_id[:10],
+                    "[DRY] %s %s %s @ %s (%s) L%d",
+                    q.side, q.outcome, q.size, q.price, q.token_id[:10], q.level,
                 )
                 log_event(
                     "place_dry", token=q.token_id, side=q.side,
@@ -273,7 +274,8 @@ class OrderManager:
         for q, resp in zip(prepared, responses):
             if getattr(resp, "ok", False) and getattr(resp, "order_id", None):
                 self._track(
-                    LiveOrder(str(resp.order_id), q.token_id, q.side, q.price, q.size)
+                    LiveOrder(str(resp.order_id), q.token_id, q.side, q.price, q.size,
+                              level=q.level)
                 )
                 placed += 1
                 log_event(
@@ -482,8 +484,9 @@ class OrderManager:
         if self.dry_run:
             return
         try:
-            found: dict[tuple[str, str], LiveOrder] = {}
-            by_id: dict[str, tuple[str, str]] = {}
+            found: dict[tuple[str, str, int], LiveOrder] = {}
+            by_id: dict[str, tuple[str, str, int]] = {}
+            grouped: dict[tuple[str, str], list[LiveOrder]] = {}
             # Пагинатор итерируется страницами — элементы через iter_items().
             async for o in self.client.list_open_orders().iter_items():
                 order = LiveOrder(
@@ -494,10 +497,17 @@ class OrderManager:
                     original_size=Decimal(str(o.original_size)),
                     size_matched=Decimal(str(o.size_matched or 0)),
                 )
-                key = (order.token_id, order.side)
-                found[key] = order
-                by_id[order.order_id] = key
+                grouped.setdefault((order.token_id, order.side), []).append(order)
                 self._remember_order(order.order_id)
+            # Уровни лестницы биржа не знает: восстанавливаем их по цене —
+            # лучший бид (или лучший аск) получает уровень 0, как у quoting.
+            for (token_id, side), orders in grouped.items():
+                orders.sort(key=lambda o: o.price, reverse=(side == "BUY"))
+                for level, order in enumerate(orders):
+                    order.level = level
+                    key = (token_id, side, level)
+                    found[key] = order
+                    by_id[order.order_id] = key
 
             if len(found) != len(self._live):
                 log.warning(

@@ -49,6 +49,9 @@ class Cfg:
         allow_directional = True
         directional_min_edge = D("0.025")
         directional_max_net = D("60")
+        ladder_levels = 1
+        ladder_step_ticks = 2
+        ladder_level_size = D("0")
         auto_merge = True
         min_merge_size = D("25")
         merge_interval_s = 0.0
@@ -863,3 +866,51 @@ def test_spot_tick_updates_only_trackers_of_its_twap_window():
     engine.spot.ingest("BTC", 109_520.0, now, window=None)   # Binance — всем
     assert engine._twap["0x30"]._last_price == 109_520.0
     assert engine._twap["0x60"]._last_price == 109_520.0
+
+
+def test_ladder_room_is_cumulative_across_levels():
+    """
+    Финальный клип размеров считает запас лимита НАКОПИТЕЛЬНО по уровням:
+    три уровня по 20 при запасе стороны 45 — третий урезается до 5 (и это
+    ниже min_order_size — отбрасывается), а не проходит целиком, как если
+    бы каждый уровень проверяли независимо.
+    """
+    engine = make_engine(FakeClient())
+    warm_spot(engine)
+    market = make_market(strike=D("109500"))
+    engine.markets["0xcond"] = market
+    put_books(engine, "0.50", "0.52")
+    engine.cfg.strategy.ladder_levels = 3
+    engine.cfg.strategy.ladder_step_ticks = 2
+    engine.cfg.strategy.ladder_level_size = D("20")
+    try:
+        # YES уже набрано 205 из 250: запас стороны 45.
+        engine.positions["0xcond"] = MarketPosition(
+            "0xcond", yes_size=D("205"), no_size=D("205"), yes_cost=D("100"), no_cost=D("100")
+        )
+        quotes = asyncio.run(engine._quotes_for_market(market))
+    finally:
+        engine.cfg.strategy.ladder_levels = 1
+        engine.cfg.strategy.ladder_level_size = D("0")
+
+    yes = sorted((q for q in quotes if q.outcome == "YES"), key=lambda q: q.level)
+    no = sorted((q for q in quotes if q.outcome == "NO"), key=lambda q: q.level)
+    # util > 0.6 => размер уровня 10; запас 45: 10 + 10 + 10 + 10 = 40, пятого нет.
+    assert [q.size for q in yes] == [D("10"), D("10"), D("10")]
+    assert [q.size for q in no] == [D("10"), D("10"), D("10")]
+    assert sum(q.size for q in yes) <= D("45") and sum(q.size for q in no) <= D("45")
+
+    # Запас 25: два уровня целиком, третий — 5 (равно min_order_size, ставится).
+    engine.cfg.strategy.ladder_levels = 3
+    engine.cfg.strategy.ladder_level_size = D("20")
+    try:
+        engine.positions["0xcond"] = MarketPosition(
+            "0xcond", yes_size=D("225"), no_size=D("225"), yes_cost=D("100"), no_cost=D("100")
+        )
+        quotes = asyncio.run(engine._quotes_for_market(market))
+    finally:
+        engine.cfg.strategy.ladder_levels = 1
+        engine.cfg.strategy.ladder_level_size = D("0")
+    yes = sorted((q for q in quotes if q.outcome == "YES"), key=lambda q: q.level)
+    assert [q.size for q in yes] == [D("10"), D("10"), D("5")]
+    assert sum(q.size for q in yes) == D("25")

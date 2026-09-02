@@ -727,19 +727,27 @@ class TradingEngine:
         )
 
         # --- финальный риск-клип размеров --------------------------------
+        # Запас лимитов НАКОПИТЕЛЬНЫЙ по уровням лестницы: каждый принятый
+        # уровень стороны уменьшает запас следующим, как если бы он уже
+        # исполнился. Иначе N уровней проходили бы клип независимо и вместе
+        # пробивали лимит. При одном уровне на сторону — прежнее поведение.
         result: list[Quote] = []
+        resting = {"YES": Decimal("0"), "NO": Decimal("0")}
         for q in quotes:
-            side_size = pos.yes_size if q.outcome == "YES" else pos.no_size
+            same = resting[q.outcome]
+            side_size = (pos.yes_size if q.outcome == "YES" else pos.no_size) + same
             # Покупка YES при лонге YES (или NO при лонге NO) увеличивает |net|.
             increases = (q.outcome == "YES" and pos.net >= 0) or (
                 q.outcome == "NO" and pos.net <= 0
             )
-            size = self.risk.clamp_order_size(
-                q.size, side_size, pos.net, increases
-            )
+            net = pos.net
+            if increases:
+                net = pos.net + same if q.outcome == "YES" else pos.net - same
+            size = self.risk.clamp_order_size(q.size, side_size, net, increases)
             if size >= market.min_order_size:
                 q.size = size
                 result.append(q)
+                resting[q.outcome] += size
         return result
 
     def _smoothed_mid(self, condition_id: str, mid: float) -> Decimal:

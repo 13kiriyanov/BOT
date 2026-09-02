@@ -112,9 +112,13 @@ class QuoteGenerator:
         position: MarketPosition,
         outcome: str,
         fv: FairValue,
+        base: Decimal | None = None,
     ) -> Decimal:
-        """Размер ордера с учётом инвентаря, времени и directional-наклона."""
-        size = self.s.order_size
+        """
+        Размер ордера с учётом инвентаря, времени и directional-наклона.
+        base — исходный размер (None = order_size; у лестницы — размер уровня).
+        """
+        size = self.s.order_size if base is None else base
 
         # У экспирации сокращаем размер: adverse selection растёт нелинейно.
         left = market.seconds_left
@@ -321,6 +325,9 @@ class QuoteGenerator:
                     yes_price, no_price, float(fv.fair),
                 )
 
+        if self.s.ladder_levels > 1:
+            return self._ladder(market, fv, position, yes_price, no_price)
+
         yes_size = self._size_for(market, position, "YES", fv)
         no_size = self._size_for(market, position, "NO", fv)
 
@@ -330,6 +337,40 @@ class QuoteGenerator:
         quotes.append(
             Quote(market.no_token_id, "NO", "BUY", no_price, no_size)
         )
+        return quotes
+
+    def _ladder(
+        self,
+        market: TargetMarket,
+        fv: FairValue,
+        position: MarketPosition,
+        yes_price: Decimal,
+        no_price: Decimal,
+    ) -> list[Quote]:
+        """
+        Лестница из ladder_levels бидов на каждой стороне. Уровень 0 — та же
+        цена, что у одиночной котировки (уже подогнана под книгу и планку
+        пары), уровень k — на k * ladder_step_ticks тиков дальше от mid,
+        размер каждого уровня — ladder_level_size (0 = order_size) с теми же
+        поправками на время, инвентарь и directional, что и обычно.
+
+        Инвариант пары: сумма лучших бидов + комиссия уже проверена выше, а
+        любая другая пара уровней дешевле — значит, невыгодной пары в
+        лестнице быть не может. Уровень, ушедший ниже одного тика,
+        отбрасывается (глубже цены нет).
+        """
+        tick = market.tick_size
+        step = tick * self.s.ladder_step_ticks
+        base = self.s.ladder_level_size or None  # 0 -> order_size
+        quotes: list[Quote] = []
+        for outcome, top in (("YES", yes_price), ("NO", no_price)):
+            size = self._size_for(market, position, outcome, fv, base)
+            token = market.token_for(outcome)  # type: ignore[arg-type]
+            for level in range(self.s.ladder_levels):
+                price = top - step * level
+                if price < tick:
+                    break
+                quotes.append(Quote(token, outcome, "BUY", price, size, level))  # type: ignore[arg-type]
         return quotes
 
     def _starving_side_quote(
