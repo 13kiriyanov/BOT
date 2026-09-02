@@ -836,3 +836,30 @@ def test_smoothed_mid_damps_jitter_and_can_be_disabled():
     raw_engine.client = FakeClient()  # type: ignore[assignment]
     raw_engine._smoothed_mid("0xcond", 0.62)
     assert float(raw_engine._smoothed_mid("0xcond", 0.58)) == pytest.approx(0.58)
+
+
+def test_spot_tick_updates_only_trackers_of_its_twap_window():
+    """
+    5-минутный рынок резолвится по 30s-ряду: тик 60s-ряда его накопитель
+    не трогает, тик 30s — трогает. Тик без окна (Binance) — общий для всех.
+    """
+    from src.fair_value import RealizedTwap
+
+    engine = make_engine(FakeClient())
+    now = time.time()
+    m30 = make_market(condition_id="0x30", twap_window_s=30, start_ts=now - 10)
+    m60 = make_market(condition_id="0x60", twap_window_s=60, start_ts=now - 10)
+    engine.markets = {"0x30": m30, "0x60": m60}
+    engine._twap["0x30"] = RealizedTwap(now - 10, now + 290)
+    engine._twap["0x60"] = RealizedTwap(now - 10, now + 290)
+
+    engine.spot.ingest("BTC", 109_500.0, now - 11, window=60)
+    assert engine._twap["0x60"]._last_ts is not None
+    assert engine._twap["0x30"]._last_ts is None      # чужое окно
+
+    engine.spot.ingest("BTC", 109_510.0, now - 11, window=30)
+    assert engine._twap["0x30"]._last_ts is not None
+
+    engine.spot.ingest("BTC", 109_520.0, now, window=None)   # Binance — всем
+    assert engine._twap["0x30"]._last_price == 109_520.0
+    assert engine._twap["0x60"]._last_price == 109_520.0

@@ -186,3 +186,87 @@ def test_resolution_flag_is_deterministic_and_changes_outcomes():
     twap = [run(seed, "twap")["pnl"] for seed in range(12)]
     endpoint = [run(seed, "endpoint")["pnl"] for seed in range(12)]
     assert twap != endpoint
+
+
+def test_reward_score_follows_docs_formula():
+    """
+    Формула наград: очки ((v - s)/v)^2 * size на ногу; двусторонность —
+    Q_min = max(min(Q1, Q2), max(Q1, Q2)/c) в [0.10, 0.90] и min(...) на
+    краях; ноги вне max_spread и размер ниже min_size не засчитываются.
+    """
+    from src.models import Quote
+    from simulate import RewardParams, reward_score
+
+    params = RewardParams(max_spread_c=3.5, min_size=20.0, c=3.0)
+    mid = 0.50
+    yes_bid = Quote("t_yes", "YES", "BUY", D("0.49"), D("20"))   # 1¢ от mid
+    no_bid = Quote("t_no", "NO", "BUY", D("0.49"), D("20"))      # аск YES 0.51: 1¢
+
+    per_leg = ((3.5 - 1.0) / 3.5) ** 2 * 20
+    assert reward_score([yes_bid, no_bid], mid, params) == pytest.approx(per_leg)
+
+    # Одна нога: делится на c (в диапазоне), на краю — ноль.
+    assert reward_score([yes_bid], mid, params) == pytest.approx(per_leg / 3.0)
+    edge_bid = Quote("t_yes", "YES", "BUY", D("0.94"), D("20"))
+    assert reward_score([edge_bid], 0.95, params) == 0.0
+
+    # Дальше max_spread или меньше min_size — не засчитывается.
+    far = Quote("t_yes", "YES", "BUY", D("0.45"), D("20"))       # 5¢ > 3.5¢
+    assert reward_score([far, no_bid], mid, params) == pytest.approx(per_leg / 3.0)
+    small = Quote("t_yes", "YES", "BUY", D("0.49"), D("10"))
+    assert reward_score([small, no_bid], mid, params) == pytest.approx(per_leg / 3.0)
+
+    # Ближе к mid — больше очков (квадратичный вес).
+    closer = Quote("t_yes", "YES", "BUY", D("0.50"), D("20"))
+    assert reward_score([closer, no_bid], mid, params) == pytest.approx(per_leg)  # min по NO
+    assert reward_score([closer], mid, params) > reward_score([yes_bid], mid, params)
+
+
+def test_reward_component_is_separate_from_trading_pnl():
+    from simulate import RewardParams
+
+    params = RewardParams(max_spread_c=3.5, min_size=20.0, daily_rate=10.0)
+    base = run_one(600, 0.55, 0.012, 0.02, 3, 0.5, 0.45, D("0"), D("0.01"),
+                   0.0, 0.0, False, True, 120.0, "twap", None)
+    with_rewards = run_one(600, 0.55, 0.012, 0.02, 3, 0.5, 0.45, D("0"), D("0.01"),
+                           0.0, 0.0, False, True, 120.0, "twap", params)
+    assert base["reward_pnl"] == 0.0 and base["pnl_total"] == base["pnl"]
+    # Без конкуренции доля в каждой засчитанной выборке равна 1, а выборки
+    # без чьих-либо очков в нормировку не входят: доля пула 1, пул рынка
+    # достаётся целиком — сколько бы минут мы ни котировали.
+    assert 0.0 < with_rewards["reward_uptime"] < 1.0
+    assert with_rewards["reward_share"] == pytest.approx(1.0)
+    assert with_rewards["reward_pnl"] == pytest.approx(10.0)
+    assert with_rewards["pnl_total"] == pytest.approx(
+        with_rewards["pnl"] + with_rewards["reward_pnl"])
+    misses = (with_rewards["reward_miss_band"] + with_rewards["reward_miss_unwind"]
+              + with_rewards["reward_miss_other"])
+    assert with_rewards["reward_uptime"] + misses == pytest.approx(1.0)
+
+
+def test_reward_share_is_normalised_over_samples_with_any_score(monkeypatch):
+    """
+    Конкуренция: доля выборки = Q_min / (Q_min + конкуренция); выборки без
+    наших очков при ненулевой конкуренции считаются нулём (пул уходит
+    другим), и награда падает пропорционально пригодности. Без конкуренции
+    награда равна пулу независимо от пригодности.
+    """
+    import simulate
+    from simulate import RewardParams
+
+    real = simulate.reward_score
+    monkeypatch.setattr(
+        simulate, "reward_score",
+        lambda quotes, p, params: 10.0 if real(quotes, p, params) > 0 else 0.0,
+    )
+    args = (600, 0.55, 0.012, 0.02, 5, 0.5, 0.45, D("0"), D("0.01"),
+            0.0, 0.0, False, True, 120.0, "twap")
+    alone = run_one(*args, RewardParams(3.5, 20.0, daily_rate=10.0, competition=0.0))
+    contested = run_one(*args, RewardParams(3.5, 20.0, daily_rate=10.0, competition=10.0))
+    assert 0.0 < alone["reward_uptime"] < 1.0
+    assert alone["reward_share"] == pytest.approx(1.0)
+    assert alone["reward_pnl"] == pytest.approx(10.0)
+    assert contested["reward_uptime"] == pytest.approx(alone["reward_uptime"])
+    assert contested["reward_share"] == pytest.approx(0.5 * contested["reward_uptime"])
+    assert contested["reward_pnl"] == pytest.approx(5.0 * contested["reward_uptime"])
+    assert contested["pnl"] == pytest.approx(alone["pnl"])  # торговля не зависит от наград

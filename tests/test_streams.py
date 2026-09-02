@@ -147,9 +147,44 @@ def test_price_feed_consumes_real_chainlink_twap_events():
     assert client.calls >= 2
     # Подписка обязана быть ТОПИКОВОЙ (symbols=None): клиентский фильтр
     # symbols в SDK сравнивает строки точно, несовпадение формата молча
-    # убивает фид. И ровно на окно резолюции — 60 секунд.
-    assert client.specs and client.specs[0].symbols is None
-    assert client.specs[0].window_seconds == 60
+    # убивает фид. И на ОБА окна резолюции разом (последовательность спек):
+    # 30s для 5-минутных рынков, 60s для 15-минутных и 4-часовых.
+    assert client.specs
+    specs = list(client.specs[0])
+    assert [s.window_seconds for s in specs] == [30, 60]
+    assert all(s.symbols is None for s in specs)
+
+
+def test_price_feed_keeps_twap_windows_as_separate_series():
+    """
+    Тики 30s и 60s одного актива — РАЗНЫЕ ряды: 5-минутный рынок читает
+    30s, и 60s-значение его не подменяет (и наоборот). Запрос без окна —
+    справочный, отдаёт любой имеющийся ряд.
+    """
+    from polymarket.models.rtds_events import CryptoPricesChainlinkTwapEvent
+
+    def ev(window: int, value: str, e18: str) -> object:
+        return CryptoPricesChainlinkTwapEvent.model_validate({
+            "type": "update", "timestamp": 1788276000000,
+            "payload": {"symbol": "btc/usd", "timestamp": 1788276000,
+                        "value": value, "full_accuracy_value": e18,
+                        "window_s": window},
+        })
+
+    client = FakeStreamClient([
+        ev(30, "109510.0", "109510000000000000000000"),
+        ev(60, "109490.0", "109490000000000000000000"),
+    ])
+    feed = SpotFeed(vol_halflife_s=45.0, momentum_halflife_s=8.0,
+                    vol_floor_annual=D("0.30"))
+    client.stopper = feed.stop
+    asyncio.run(drive(feed.run_polymarket(client)))  # type: ignore[arg-type]
+
+    assert feed.price("BTC", 30) == 109510.0
+    assert feed.price("BTC", 60) == 109490.0
+    assert feed.price("BTC") is not None          # справочный запрос
+    assert feed.price("ETH", 30) is None           # чужого ряда нет — None
+    assert feed.is_stale("ETH", 4.0, 30)
 
 
 def _twap_event(symbol: str, value: str, e18: str) -> object:
@@ -170,9 +205,10 @@ class RecordingFeed(SpotFeed):
         super().__init__(*args, **kwargs)
         self.ingested: list[tuple[str, float]] = []
 
-    def ingest(self, asset: str, price: float, ts: float | None = None) -> None:
+    def ingest(self, asset: str, price: float, ts: float | None = None,
+               window: int | None = None) -> None:
         self.ingested.append((asset, price))
-        super().ingest(asset, price, ts)
+        super().ingest(asset, price, ts, window)
 
 
 def test_price_feed_drops_foreign_assets_from_topic_stream(caplog):
@@ -215,8 +251,8 @@ def test_price_feed_drops_foreign_assets_from_topic_stream(caplog):
     debugs = [r.message for r in caplog.records if r.levelno == _logging.DEBUG]
     assert sum("чужой символ" in m for m in debugs) == 2  # zec и sol
 
-    # Оценщики переведены в режим сглаженного ряда (лаг-выборка 60с).
-    assert feed._est("BTC")._sample_interval == 60.0
+    # Оценщики переведены в режим сглаженного ряда (лаг-выборка >= окна).
+    assert feed._est("BTC", 60)._sample_interval == 60.0
 
 
 def test_orderbook_consumes_snapshots_through_sdk_shaped_subscribe():

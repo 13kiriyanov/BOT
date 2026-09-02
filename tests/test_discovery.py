@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -28,6 +29,8 @@ from polymarket.models.gamma.series import Series  # noqa: E402
 from polymarket.pagination import AsyncPaginator, Page  # noqa: E402
 
 from src.discovery import MarketDiscovery  # noqa: E402
+
+D = Decimal
 
 
 def iso_in(seconds: float) -> str:
@@ -48,6 +51,9 @@ def market_dict(n: int = 1, **over) -> dict:
         "clobTokenIds": f'["{n}11","{n}22"]',
         "orderPriceMinTickSize": "0.01",
         "orderMinSize": "5",
+        # Ссылка на поток резолюции — как в описании живых рынков.
+        "description": ("Resolves per Chainlink TWAP: "
+                        "https://data.chain.link/streams/btc-usd-twap-60s-streams"),
     }
     base.update(over)
     return base
@@ -438,6 +444,68 @@ def test_diag_exit_code_2_when_bot_settings_find_nothing(monkeypatch, capsys):
     assert "слаги" in out.lower()
 
 
+def test_twap_window_parsing_description_then_slug_duration():
+    """
+    Окно ряда резолюции: ссылка в описании — истина; иначе по длительности
+    из слага (5m -> 30s, 15m/4h -> 60s по анонсу); иначе None.
+    """
+    from src.discovery import parse_twap_window_s
+
+    link30 = "https://data.chain.link/streams/btc-usd-twap-30s-streams"
+    link60 = "https://data.chain.link/streams/eth-usd-twap-60s-streams"
+    assert parse_twap_window_s(link30, "btc-updown-15m-1788276000") == 30  # описание важнее
+    assert parse_twap_window_s(link60, "btc-updown-5m-1788276000") == 60
+    assert parse_twap_window_s("", "btc-updown-5m-1788276000") == 30
+    assert parse_twap_window_s("", "eth-updown-15m-1788276000") == 60
+    assert parse_twap_window_s("", "btc-updown-4h-1788276000") == 60
+    assert parse_twap_window_s("", "bitcoin-up-or-down-3pm-et") is None
+    assert parse_twap_window_s("twap-45s", "btc-updown-5m-1788276000") is None  # чужое окно
+
+
+def test_market_without_twap_window_is_dropped_and_counted():
+    """Не знаем ряд резолюции — не торгуем (не кормим модель чужим окном)."""
+    ev = gamma_event([
+        market_dict(1, description=""),                              # нет ни ссылки, ни длительности
+        market_dict(2, slug="btc-updown-5m-1788276000", description=""),  # по слагу -> 30s
+    ])
+    client = FakeGammaClient(events=[ev])
+    disc = make_discovery(client)
+
+    found = find(disc)
+
+    assert [t.twap_window_s for t in found] == [30]
+    assert disc.last_funnel.drop_no_twap_window == 1
+
+
+def test_reward_program_fields_flow_into_target():
+    ev = gamma_event([market_dict(
+        1, rewardsMinSize="20", rewardsMaxSpread="3.5",
+        clobRewards=[{"id": "77", "conditionId": "0x" + "01" * 32,
+                      "assetAddress": "0xusdc", "rewardsAmount": "0",
+                      "rewardsDailyRate": "150", "startDate": "2026-08-07",
+                      "endDate": "2099-12-31"}],
+    )])
+    client = FakeGammaClient(events=[ev])
+    found = find(make_discovery(client))
+
+    assert len(found) == 1
+    t = found[0]
+    assert t.rewards_max_spread == D("3.5")
+    assert t.rewards_min_size == D("20")
+    assert t.rewards_daily_rate == D("150")
+    assert t.rewards_end_date == "2099-12-31"
+
+    # Истёкшая программа не считается действующей.
+    ev_old = gamma_event([market_dict(
+        3, clobRewards=[{"id": "78", "conditionId": "0x" + "03" * 32,
+                         "assetAddress": "0xusdc", "rewardsAmount": "0",
+                         "rewardsDailyRate": "150", "startDate": "2026-08-07",
+                         "endDate": "2026-08-31"}],
+    )])
+    found_old = find(make_discovery(FakeGammaClient(events=[ev_old])))
+    assert found_old[0].rewards_daily_rate is None
+
+
 def test_slug_start_ts_parsing():
     """Хвост слага btc-updown-5m-<ts> — unix-время начала окна."""
     from src.discovery import parse_slug_start_ts
@@ -454,3 +522,25 @@ def test_slug_start_ts_parsing():
     disc = make_discovery(client)
     found = find(disc)
     assert found and found[0].start_ts == 1788276000.0
+
+
+def test_book_reward_scores_filters_dust_and_spread():
+    """
+    diag.py: очки книги по формуле наград — пыль мельче min_size не входит
+    ни в mid, ни в очки; уровни дальше max_spread дают ноль; порядок
+    уровней не важен; пустая после отсева сторона — None (очков ни у кого).
+    """
+    from diag import book_reward_scores
+
+    bids = [(D("0.49"), D("5")), (D("0.48"), D("100")), (D("0.40"), D("200"))]
+    asks = [(D("0.51"), D("5")), (D("0.52"), D("50"))]
+    scored = book_reward_scores(bids, asks, D("3.5"), D("20"))
+    assert scored is not None
+    mid, q_one, q_two = scored
+    assert mid == D("0.50")  # пыль 0.49/0.51 не сдвинула mid
+    weight = ((D("3.5") - 2) / D("3.5")) ** 2  # 2¢ от mid
+    assert float(q_one) == pytest.approx(float(weight * 100))  # бид 0.40 (10¢) — ноль
+    assert float(q_two) == pytest.approx(float(weight * 50))
+    assert book_reward_scores(list(reversed(bids)), list(reversed(asks)),
+                              D("3.5"), D("20")) == scored
+    assert book_reward_scores(bids, [(D("0.52"), D("10"))], D("3.5"), D("20")) is None

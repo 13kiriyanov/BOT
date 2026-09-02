@@ -43,6 +43,36 @@ ASSET_PATTERNS = {
 PRICE_RE = re.compile(r"\$?\s*([0-9]{3,7}(?:,[0-9]{3})*(?:\.[0-9]+)?)")
 # Unix-время начала окна в хвосте слага: btc-updown-5m-1788276000.
 SLUG_START_TS_RE = re.compile(r"-(\d{10})$")
+# Окно потока TWAP из описания рынка: ссылка вида
+# https://data.chain.link/streams/btc-usd-twap-60s-streams.
+DESC_TWAP_WINDOW_RE = re.compile(r"twap-(\d{2,3})s", re.I)
+# Длительность окна из слага: btc-updown-5m-..., eth-updown-15m-..., -4h-.
+SLUG_DURATION_RE = re.compile(r"-(\d+)(m|h)-\d{10}$")
+# Окно TWAP по длительности рынка — анонс Polymarket (7 августа 2026):
+# 30s для 5-минутных, 60s для 15-минутных и 4-часовых. Резерв, если в
+# описании ссылки на поток нет.
+TWAP_WINDOW_BY_DURATION_S = {300: 30, 900: 60, 4 * 3600: 60}
+SUPPORTED_TWAP_WINDOWS = (30, 60)
+
+
+def parse_twap_window_s(description: str, slug: str) -> int | None:
+    """
+    Окно потока Chainlink TWAP, по которому резолвится рынок.
+
+    1. Явная ссылка в описании (`...-twap-30s-streams`) — истина.
+    2. Иначе по длительности окна из слага (таблица анонса).
+    None — определить нельзя (рынок без модели, а не с чужим рядом).
+    """
+    match = DESC_TWAP_WINDOW_RE.search(description or "")
+    if match:
+        window = int(match.group(1))
+        return window if window in SUPPORTED_TWAP_WINDOWS else None
+    duration = SLUG_DURATION_RE.search(slug or "")
+    if duration:
+        amount, unit = int(duration.group(1)), duration.group(2)
+        seconds = amount * (60 if unit == "m" else 3600)
+        return TWAP_WINDOW_BY_DURATION_S.get(seconds)
+    return None
 # Ранняя остановка поиска по endDate: берём события, истекающие не позже
 # max_seconds + этот запас. Дальше по ascending-порядку — только позже.
 SEARCH_END_LOOKAHEAD_S = 120.0
@@ -79,6 +109,30 @@ def _parse_ts(value) -> float | None:  # noqa: ANN001
         return dt.timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def _active_rewards(rewards) -> tuple[Decimal | None, str | None]:  # noqa: ANN001
+    """
+    Суммарная дневная ставка наград по действующим записям clobRewards
+    (end_date пустой или не раньше сегодняшнего дня) и самая поздняя дата
+    окончания. (None, None) — программы у рынка нет.
+    """
+    entries = getattr(rewards, "clob_rewards", None) or []
+    if not entries:
+        return None, None
+    today = datetime.now(timezone.utc).date()
+    total = Decimal("0")
+    latest_end: str | None = None
+    for entry in entries:
+        end = getattr(entry, "end_date", None)
+        if end is not None and end < today:
+            continue
+        rate = getattr(entry, "rewards_daily_rate", None)
+        if rate is not None:
+            total += Decimal(str(rate))
+        if end is not None and (latest_end is None or str(end) > latest_end):
+            latest_end = str(end)
+    return (total if total > 0 else None), latest_end
 
 
 def detect_asset(text: str) -> str | None:
@@ -138,6 +192,7 @@ class DiscoveryFunnel:
     drop_window_near: int = 0   # до экспирации меньше min (уже поздно)
     drop_no_tokens: int = 0     # нет token_id одной из ног
     drop_no_asset: int = 0      # не распознан BTC/ETH
+    drop_no_twap_window: int = 0  # не определить окно потока резолюции
     drop_dup: int = 0           # дубль condition_id
     drop_overflow: int = 0      # прошли всё, но не влезли в max_markets
     accepted: int = 0           # итог: сколько рынков торгуем
@@ -151,6 +206,7 @@ class DiscoveryFunnel:
             f"стакан={self.drop_book} без_даты={self.drop_no_end} "
             f"окно_рано={self.drop_window_far} окно_поздно={self.drop_window_near} "
             f"токены={self.drop_no_tokens} актив={self.drop_no_asset} "
+            f"окно_twap={self.drop_no_twap_window} "
             f"дубли={self.drop_dup} сверх_лимита={self.drop_overflow}"
         )
 
@@ -332,20 +388,33 @@ class MarketDiscovery:
             funnel.drop_no_asset += 1
             return None
 
+        slug = str(getattr(m, "slug", ""))
+        description = str(getattr(m, "description", "") or "")
+        # Ряд резолюции ЭТОГО рынка. Не определить — не торгуем: кормить
+        # модель чужим окном хуже, чем пропустить рынок.
+        twap_window = parse_twap_window_s(description, slug)
+        if twap_window is None:
+            funnel.drop_no_twap_window += 1
+            return None
+
         trading = getattr(m, "trading", None)
         tick = Decimal(str(getattr(trading, "minimum_tick_size", None) or "0.01"))
         min_size = Decimal(str(getattr(trading, "minimum_order_size", None) or "5"))
         rewards = getattr(m, "rewards", None)
-        fee_rate, fee_exponent = self._resolve_fees(trading, str(getattr(m, "slug", "")))
+        fee_rate, fee_exponent = self._resolve_fees(trading, slug)
+        daily_rate, rewards_end = _active_rewards(rewards)
 
         target = TargetMarket(
             condition_id=str(m.condition_id),
-            slug=str(getattr(m, "slug", "")),
+            slug=slug,
             question=str(getattr(m, "question", "")),
             yes_token_id=yes_token,
             no_token_id=no_token,
             end_ts=end_ts,
-            start_ts=parse_slug_start_ts(str(getattr(m, "slug", ""))),
+            start_ts=parse_slug_start_ts(slug),
+            twap_window_s=twap_window,
+            rewards_daily_rate=daily_rate,
+            rewards_end_date=rewards_end,
             tick_size=tick,
             min_order_size=min_size,
             neg_risk=bool(getattr(state, "neg_risk", False)),

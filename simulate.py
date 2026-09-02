@@ -40,6 +40,7 @@ import math
 import multiprocessing
 import random
 import statistics
+from dataclasses import dataclass
 from decimal import Decimal
 from statistics import NormalDist
 
@@ -102,6 +103,74 @@ TREND_FLOW_STARVE = 0.3
 # диапазона бот не котирует — почти решённый исход.
 QUOTE_MID_MIN = 0.10
 QUOTE_MID_MAX = 0.90
+
+
+# --- Ликвидити-награды Polymarket ------------------------------------------
+# Структура — по docs.polymarket.com/programs/liquidity-rewards (страница
+# закрыта для чтения из среды разработки, структура собрана по поисковым
+# сниппетам и сторонним разборам — СВЕРИТЬ по живой странице):
+#   * каждый ордер внутри max_spread (v, центы от mid) размера >= min_size
+#     получает очки S = ((v - s) / v)^2 * size, s — расстояние от mid;
+#   * Q_one = сумма очков бидов, Q_two = сумма очков асков (наш BUY NO ==
+#     аск YES по 1 - price);
+#   * при mid в [0.10, 0.90]: Q_min = max(min(Q_one, Q_two),
+#     max(Q_one, Q_two) / c), c — «in-game multiplier» (для крипторынков
+#     значение в docs НЕ названо; 3 — распространённая цифра, НЕ проверена);
+#     вне диапазона — только двусторонняя ликвидность: Q_min = min(...);
+#   * выборка раз в минуту; в выборке доля = Q_min / сумма Q_min всех
+#     мейкеров (Q_normal), сумма долей за эпоху нормируется по всем
+#     мейкерам (Q_final = Q_epoch / sum Q_epoch) и умножается на пул рынка
+#     (rewardsDailyRate). Выборки, где никто не набрал очков, не входят ни
+#     в чей счёт: пул 5-минутного рынка делится между теми, кто котировал
+#     в его 5 минут жизни. «Дневная» ставка для таких рынков — ставка НА
+#     РЫНОК за его жизнь (месячный пул серии делится на все её рынки), а
+#     не пропорция суток.
+#   * выплата раз в сутки (~00:00 UTC), минимум $1.
+# Что НЕ известно офлайн и задаётся параметрами: max_spread/min_size/пул
+# рынка (поля рынка в Gamma, печатает diag.py), конкуренция (сумма Q_min
+# других мейкеров — границы по живому стакану печатает diag.py), значение
+# c, точное определение «size-cutoff-adjusted midpoint» (mid по книге без
+# ордеров мельче min_size — наша интерпретация).
+REWARD_SAMPLE_INTERVAL_S = 60
+
+
+@dataclass(frozen=True)
+class RewardParams:
+    """Параметры программы наград для одного прогона; None — награды выкл."""
+
+    max_spread_c: float          # v: максимальный засчитываемый спред, центы
+    min_size: float              # минимальный засчитываемый размер, shares
+    daily_rate: float = 0.0      # ставка пула рынка, USDC/день (0 = только метрики)
+    competition: float = 0.0     # сумма Q_min ДРУГИХ мейкеров в единицах очков
+    c: float = 3.0               # in-game multiplier (НЕ проверен для крипто)
+
+
+def reward_score(quotes, p_mkt: float, params: RewardParams) -> float:  # noqa: ANN001
+    """Q_min нашей пары котировок в один момент выборки (формула выше)."""
+    v = params.max_spread_c
+    q_bid = q_ask = 0.0
+    for q in quotes:
+        if float(q.size) < params.min_size:
+            continue
+        # Всё в координатах книги YES (зеркальность матчинга): BUY NO по p ==
+        # аск YES по 1 - p, SELL NO по p == бид YES по 1 - p. Аски тоже
+        # засчитываются (Q_two) — в том числе аск разгрузки.
+        yes_price = float(q.price) if q.outcome == "YES" else 1.0 - float(q.price)
+        is_bid = (q.side == "BUY") == (q.outcome == "YES")
+        distance_c = ((p_mkt - yes_price) if is_bid else (yes_price - p_mkt)) * 100.0
+        # Ордер внутри спреда (за mid) становится лучшей котировкой и
+        # сдвигает mid к себе: расстояние ~0, а не отрицательное.
+        distance_c = max(distance_c, 0.0)
+        if distance_c > v:
+            continue
+        score = ((v - distance_c) / v) ** 2 * float(q.size)
+        if is_bid:
+            q_bid += score
+        else:
+            q_ask += score
+    if QUOTE_MID_MIN <= p_mkt <= QUOTE_MID_MAX:
+        return max(min(q_bid, q_ask), max(q_bid, q_ask) / params.c)
+    return min(q_bid, q_ask)
 
 Z95 = 1.96
 
@@ -171,13 +240,16 @@ def run_one(window_s: int, sigma: float, market_noise: float,
             trend_prob: float = 0.0, trend_strength: float = 0.0,
             use_regime: bool = False, use_unwind: bool = True,
             max_net: float | None = None,
-            resolution: str = "twap") -> dict:
+            resolution: str = "twap",
+            reward: RewardParams | None = None) -> dict:
     """
     Одно торговое окно.
 
     resolution: 'twap' (дефолт, как живые рынки: исход по среднему цены за
     окно, рынок и модель ценят среднее) или 'endpoint' (историческая
     модель конечной точки — для сравнительных прогонов).
+    reward: параметры программы ликвидити-наград; None — награды не
+    моделируются (reward_pnl == 0, метрики пригодности не считаются).
     """
     # Отдельный поток случайности на каждое НАЗНАЧЕНИЕ. Прогоны с одним
     # seed и разной toxicity получают одинаковые базовую траекторию спота,
@@ -239,7 +311,19 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         neg_risk=False, asset="BTC", strike=D(str(strike)),
         fees_enabled=fee_rate > 0, fee_rate=fee_rate,
         fee_exponent=D("1") if fee_rate > 0 else D("0"),
+        # Как в движке: параметры программы наград зажимают полуспред
+        # и поднимают размер до засчитываемого.
+        rewards_max_spread=D(str(reward.max_spread_c)) if reward else None,
+        rewards_min_size=D(str(reward.min_size)) if reward else None,
     )
+    reward_samples = 0
+    reward_eligible = 0
+    reward_score_sum = 0.0
+    reward_share_sum = 0.0
+    reward_pool_samples = 0  # выборки, где хоть кто-то набрал очки
+    # Почему выборка не засчитана: край диапазона (котировок нет),
+    # разгрузка (SELL вместо пары), прочее (одна нога вне спреда и т.п.).
+    reward_miss = {"band": 0, "unwind": 0, "other": 0}
 
     # Лимиты как в связке конфигов реального бота: кросс-валидация требует
     # directional_max_net <= max_net_exposure, поэтому при свипе лимита
@@ -318,6 +402,23 @@ def run_one(window_s: int, sigma: float, market_noise: float,
                 quotes = quoter.build_quotes(
                     market, fv, pos, yes_book, no_book, regime_state
                 )
+
+        # --- Ликвидити-награды: выборка раз в минуту ---------------------
+        if reward is not None and step % REWARD_SAMPLE_INTERVAL_S == 0:
+            reward_samples += 1
+            score = reward_score(quotes, p_mkt, reward)
+            if score > 0 or reward.competition > 0:
+                reward_pool_samples += 1
+            if score > 0:
+                reward_eligible += 1
+                reward_score_sum += score
+                reward_share_sum += score / (score + reward.competition)
+            elif not (QUOTE_MID_MIN <= p_mkt <= QUOTE_MID_MAX):
+                reward_miss["band"] += 1
+            elif any(q.side == "SELL" for q in quotes):
+                reward_miss["unwind"] += 1
+            else:
+                reward_miss["other"] += 1
 
         # --- Модель исполнения ------------------------------------------
         # Три эффекта, без которых симуляция врёт в вашу пользу:
@@ -422,8 +523,32 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     pos.realized_pnl += settle - cost
 
     total_bought = bought["YES"] + bought["NO"]
+    # Награда рынка: пул рынка (rewardsDailyRate) x наша доля Q_final —
+    # средняя доля по выборкам, где хоть кто-то набрал очки (см. блок
+    # «Ликвидити-награды» выше). Без competition доля равна 1 в каждой
+    # засчитанной выборке — это ВЕРХНЯЯ граница («мы одни в спреде»), а не
+    # оценка: пул достаётся целиком, сколько бы минут мы ни котировали.
+    reward_pnl = 0.0
+    reward_uptime = 0.0
+    reward_share = 0.0
+    if reward is not None and reward_samples > 0:
+        reward_uptime = reward_eligible / reward_samples
+        if reward_pool_samples > 0:
+            reward_share = reward_share_sum / reward_pool_samples
+        reward_pnl = reward.daily_rate * reward_share
     return {
         "pnl": float(pos.realized_pnl),
+        "reward_enabled": reward is not None,
+        "reward_pnl": reward_pnl,
+        "reward_share": reward_share,
+        "pnl_total": float(pos.realized_pnl) + reward_pnl,
+        # Доля минутных выборок, где наша пара засчитана (Q_min > 0), и
+        # средние очки на засчитанную выборку — метрики БЕЗ неизвестных.
+        "reward_uptime": reward_uptime,
+        "reward_score": (reward_score_sum / reward_eligible) if reward_eligible else 0.0,
+        "reward_miss_band": reward_miss["band"] / reward_samples if reward_samples else 0.0,
+        "reward_miss_unwind": reward_miss["unwind"] / reward_samples if reward_samples else 0.0,
+        "reward_miss_other": reward_miss["other"] / reward_samples if reward_samples else 0.0,
         "fills": fills,
         "merged": float(pos.merged_pairs),
         "residual_net": float(pos.net),
@@ -455,17 +580,59 @@ def run_level(
         use_unwind = not args.no_unwind
     if max_net is None:
         max_net = args.max_net
+    reward = reward_params_from_args(args)
     tasks = [
         (args.window, args.sigma, args.noise, args.spread, seed,
          toxicity, args.queue, Decimal(args.fee_rate), Decimal(args.merge_gas),
          args.trend_prob, args.trend_strength, use_regime, use_unwind, max_net,
-         args.resolution)
+         args.resolution, reward)
         for seed in range(args.runs)
     ]
     if args.jobs > 1:
         with multiprocessing.Pool(args.jobs) as pool:
             return pool.starmap(run_one, tasks, chunksize=25)
     return [run_one(*t) for t in tasks]
+
+
+def reward_params_from_args(args) -> RewardParams | None:  # noqa: ANN001
+    """Параметры наград из CLI; без --reward-max-spread награды выключены."""
+    if getattr(args, "reward_max_spread", None) is None:
+        return None
+    return RewardParams(
+        max_spread_c=args.reward_max_spread,
+        min_size=args.reward_min_size,
+        daily_rate=args.reward_daily_rate,
+        competition=args.reward_competition,
+        c=args.reward_c,
+    )
+
+
+def reward_stats(results: list[dict]) -> str:
+    """
+    Сводка наград: пригодность (доля минутных выборок с нашими очками),
+    средний Q_min засчитанной выборки (очки — сравнивать с конкуренцией по
+    стакану из diag.py), доля пула Q_final, награда за рынок и — главное —
+    какой ПУЛ РЫНКА (rewardsDailyRate) нужен при этой доле, чтобы торговый
+    PnL вышел в ноль: needed = -PnL / share, USDC на рынок.
+    """
+    if not results or not results[0].get("reward_enabled"):
+        return ""
+    uptime = statistics.mean(r["reward_uptime"] for r in results)
+    share = statistics.mean(r["reward_share"] for r in results)
+    scored = [r["reward_score"] for r in results if r["reward_uptime"] > 0]
+    qmin = statistics.mean(scored) if scored else 0.0
+    reward_pnl = statistics.mean(r["reward_pnl"] for r in results)
+    pnl = statistics.mean(r["pnl"] for r in results)
+    total, total_half = mean_ci([r["pnl_total"] for r in results])
+    needed = (-pnl / share) if share > 0 else float("inf")
+    band = statistics.mean(r["reward_miss_band"] for r in results)
+    unwind = statistics.mean(r["reward_miss_unwind"] for r in results)
+    other = statistics.mean(r["reward_miss_other"] for r in results)
+    return (f"награды: пригодность {uptime:5.1%} (мимо: край {band:.0%}, "
+            f"разгрузка {unwind:.0%}, прочее {other:.0%}) | Q_min≈{qmin:.1f} | "
+            f"доля пула {share:.2f} | награда {reward_pnl:+6.2f} | "
+            f"итого {total:+7.2f} ± {total_half:.2f} | "
+            f"для нуля нужен пул рынка ≥ {needed:6.2f} USDC при этой доле")
 
 
 def group_stats(results: list[dict]) -> str:
@@ -516,6 +683,8 @@ def print_level_report(results: list[dict]) -> None:
     print(f"Средний |остаток|   : {statistics.mean([r['abs_residual'] for r in results]):.1f} shares")
     print(f"Комиссии за окно    : {statistics.mean(fees):.3f} USDC")
     print(f"Газ merge за окно   : {statistics.mean(gas):.3f} USDC")
+    if results and results[0].get("reward_enabled"):
+        print(f"Ликвидити-{reward_stats(results)}")
     print_trend_split(results)
 
 
@@ -538,6 +707,8 @@ def run_sweep(args, levels: list[float]) -> None:
         )
         print(f"toxicity {level:4.2f} | PnL {mean:+7.2f} ± {half:.2f} | "
               f"прибыльных {wins:.1%} ± {win_half:.1%}")
+        if reward_params_from_args(args) is not None:
+            print(f"  {reward_stats(results)}")
         print_trend_split(results)
 
     print("-" * 62)
@@ -759,6 +930,20 @@ def main() -> None:
     ap.add_argument("--resolution", choices=["twap", "endpoint"], default="twap",
                     help="резолюция окна: twap — как живые рынки (дефолт); "
                          "endpoint — историческая модель конечной точки")
+    ap.add_argument("--reward-max-spread", type=float, default=None,
+                    help="ликвидити-награды: max spread рынка в центах "
+                         "(rewardsMaxSpread из diag.py); без него награды выкл")
+    ap.add_argument("--reward-min-size", type=float, default=20.0,
+                    help="минимальный засчитываемый размер (rewardsMinSize)")
+    ap.add_argument("--reward-daily-rate", type=float, default=0.0,
+                    help="пул рынка (rewardsDailyRate), USDC за жизнь рынка; "
+                         "0 — считать только пригодность и нужный пул")
+    ap.add_argument("--reward-competition", type=float, default=0.0,
+                    help="сумма Q_min других мейкеров (очки); 0 — верхняя "
+                         "граница «мы одни в спреде»")
+    ap.add_argument("--reward-c", type=float, default=3.0,
+                    help="in-game multiplier формулы наград (для крипто в docs "
+                         "не назван — НЕ проверен)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="процессов для параллельного прогона")
     args = ap.parse_args()
