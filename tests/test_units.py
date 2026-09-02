@@ -292,6 +292,16 @@ def test_crypto_prices_payload_shape_and_filter_contract():
     spec_wide = CryptoPricesChainlinkTwapSpec(window_seconds=60)
     assert spec_wide.symbols is None
 
+    # Матчер фильтрует по ОКНУ: подписка 30s не получает 60s-тики и
+    # наоборот — на этом стоит раздельность рядов 30s/60s в SpotFeed.
+    # Подписка последовательностью спек отдаёт MergedSubscriptionHandle
+    # той же формы (CM + async-итератор), что и одиночная.
+    assert matcher_for(CryptoPricesChainlinkTwapSpec(window_seconds=30))(ev) is False
+    from polymarket._internal.streams.merged_handle import MergedSubscriptionHandle
+
+    for attr in ("__aenter__", "__aexit__", "__aiter__", "__anext__", "close"):
+        assert hasattr(MergedSubscriptionHandle, attr), attr
+
     # Механизм прошлого бага, закреплённый как контракт: точечный фильтр
     # в «неправильном» формате НЕ пропускает wire-событие.
     exact_filter = matcher_for(
@@ -388,3 +398,32 @@ def test_user_trade_payload_units_and_maker_shape():
     mo = t.maker_orders[0]            # события НЕ нормализован под получателя
     assert (mo.side, mo.price, mo.matched_amount) == ("BUY", D("0.49"), D("20"))
     assert mo.order_id == "our-1"
+
+
+def test_order_book_levels_are_human_units_best_is_last():
+    """
+    get_order_book(token_id=...) (diag.py, оценка конкуренции за награды):
+    bids/asks — уровни с price/size в ЧЕЛОВЕЧЕСКИХ единицах (Decimal), bids
+    по возрастанию цены, asks по убыванию — ЛУЧШИЙ уровень ПОСЛЕДНИЙ
+    ([-1]), так его берёт и сам SDK. diag.py от порядка не зависит
+    (max/min), но код по [0] возьмёт худший уровень и не упадёт.
+    """
+    import inspect
+
+    from polymarket import AsyncPublicClient
+    from polymarket.models.clob.order_book import OrderBook
+
+    raw = {
+        "market": "0x" + "ab" * 32, "asset_id": "123456", "timestamp": "1700000000000",
+        "bids": [{"price": "0.40", "size": "200"}, {"price": "0.48", "size": "100.5"}],
+        "asks": [{"price": "0.60", "size": "50"}, {"price": "0.52", "size": "10"}],
+        "min_order_size": "5", "tick_size": "0.01", "neg_risk": False, "hash": "h",
+    }
+    book = OrderBook.model_validate(raw)
+    assert book.bids[-1].price == Decimal("0.48")
+    assert book.bids[-1].size == Decimal("100.5")
+    assert book.asks[-1].price == Decimal("0.52")
+    src = inspect.getsource(OrderBook._repr_html_)
+    assert "self.bids[-1]" in src and "self.asks[-1]" in src
+    sig = inspect.signature(AsyncPublicClient.get_order_book)
+    assert sig.parameters["token_id"].kind is inspect.Parameter.KEYWORD_ONLY

@@ -32,6 +32,27 @@ Polymarket в мае 2026, репозиторий read-only. Если видиш
 покрытого начала окна НЕ работает — это честность, а не баг: вероятности
 среднего без его реализованной части не существует. Не переписывай модель
 обратно на конечную точку и не корми её спотом.
+Окно TWAP зависит от длительности рынка: 5m → 30 с, 15m/4h → 60 с (анонс
+Polymarket от 7 августа 2026). `TargetMarket.twap_window_s` берётся из
+ссылки в описании рынка (`…-twap-30s-…`), резерв — длительность из слага;
+рынок без определимого окна отсеивается (`drop_no_twap_window`). Фид
+подписан на оба окна одним `subscribe([...])` и ведёт серии (asset, window)
+раздельно; трекеры рынка кормятся только тиками своего окна.
+
+**Ликвидити-награды — отдельная компонента экономики, не котирования.**
+Формула программы (docs.polymarket.com/programs/liquidity-rewards): очки
+ордера `((v − s)/v)² · size` внутри `rewards_max_spread` (v, центы от mid)
+при размере ≥ `rewards_min_size`; `Q_min = max(min(Q_bid, Q_ask),
+max(Q_bid, Q_ask)/c)` при mid в [0.10, 0.90], вне — только двусторонняя;
+выборка раз в минуту, доля пула рынка = наша сумма долей / сумма по всем
+мейкерам, пул рынка — `rewardsDailyRate` из `clobRewards` (для 5m/15m это
+ставка НА РЫНОК за его жизнь, не пропорция суток). Значение c для крипто,
+конкуренция и продолжение программы после августа 2026 офлайн НЕ известны —
+их печатает `diag.py` (параметры и границы конкуренции по стакану), а
+`simulate.py --reward-*` считает награду отдельной строкой PnL. Не вшивай
+награды в quoting как «доход»: единственное, что quoting уже делает, —
+зажимает полуспред в `rewards_max_spread` и поднимает размер до
+`rewards_min_size` (см. незакрытую задачу 14).
 
 **Главный инвариант.** Сумма двух бидов ПЛЮС комиссия обеих ног ВСЕГДА
 строго меньше `max_pair_cost` — после округления к тикам и после подгонки
@@ -89,7 +110,8 @@ side/price/size — его; наша мейкерская нога лежит в
 | user-stream trade → price/size | человеческие; верхний уровень — тейкер, наша нога в maker_orders | `test_user_trade_payload_units_and_maker_shape` |
 | `subscribe(spec)` | КОРУТИНА: `async with await client.subscribe(...)`; без await все стримы мертвы | `test_subscribe_is_a_coroutine_returning_handle` |
 | любой `list_*()` (пагинатор) | `async for` отдаёт ОБЪЕКТЫ Page; элементы — только через `.iter_items()`. Забытый iter_items не падает: getattr по Page молча даёт пустоту — «рынков/позиций/ордеров нет» | `test_paginator_iterates_pages_not_items` |
-| crypto-стрим (CryptoPricesChainlinkTwapSpec, 60s) | payload.symbol ('btc/usd')/value (точное значение — из full_accuracy_value, шкала 1e18)/window_s; фильтр symbols — КЛИЕНТСКИЙ, точное сравнение строк: несовпадение формата молча убивает весь фид. Подписка топиковая (symbols не передаём), нормализация наша | `test_crypto_prices_payload_shape_and_filter_contract` |
+| crypto-стрим (CryptoPricesChainlinkTwapSpec, окна 30s и 60s — оба одним `subscribe([...])`, MergedSubscriptionHandle; `window_seconds` события — часть ключа серии) | payload.symbol ('btc/usd')/value (точное значение — из full_accuracy_value, шкала 1e18)/window_s; фильтр symbols — КЛИЕНТСКИЙ, точное сравнение строк: несовпадение формата молча убивает весь фид. Подписка топиковая (symbols не передаём), нормализация наша | `test_crypto_prices_payload_shape_and_filter_contract` |
+| `get_order_book(token_id)` (diag.py, конкуренция за награды) | bids/asks — уровни price/size в человеческих единицах (Decimal); bids по возрастанию, asks по убыванию — ЛУЧШИЙ уровень ПОСЛЕДНИЙ (`[-1]`); diag берёт max/min и от порядка не зависит | `test_order_book_levels_are_human_units_best_is_last` |
 | market-стрим (book/price_change/best_bid_ask) | payload.token_id (алиас asset_id), bids/asks c price/size, price_changes[] со своими token_id/price/size/side | `test_market_stream_payload_shape` |
 
 ## Карта модулей
@@ -197,3 +219,17 @@ API без ключей и ордеров, печатает актуальные
    BTC (~0.4-0.7 годовых в спокойные дни). Если поток тикает сильно реже
    раза в минуту, выборка станет ещё реже — сторож расхождения останется
    последней защитой.
+13. Ликвидити-награды смоделированы по структуре формулы, но без живых
+   чисел: пул рынка и даты (`clobRewards`, печатает diag.py), конкуренция
+   (границы по стакану — diag.py, `--reward-competition` в simulate.py),
+   значение c («in-game multiplier», принято 3 — не проверено), точное
+   определение size-cutoff-adjusted midpoint и продолжение программы
+   «$1M за август 2026» после августа — всё это проверяется только на
+   живом API и по факту выплат (дашборд наград). Симулятор: пул
+   достаётся целиком при отсутствии конкуренции — верхняя граница.
+14. `rewards_min_size` в `_size_for` поднимает размер ПОСЛЕ инвентарного
+   дросселя (util > 0.6 → ×0.5, directional ×0.8): на рынке с
+   min_size ≥ order_size дроссель не работает вовсе, размер всегда
+   min_size. В симуляторе это меняет торговый PnL на ±0.4 USDC/окно и
+   поднимает |остаток| на ~15%. Не исправлено: выбор «награда или
+   дроссель» — решение по живым цифрам пула, а не по симулятору.

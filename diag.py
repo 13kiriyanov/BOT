@@ -50,6 +50,7 @@ from src.discovery import (
     _parse_ts,
     detect_asset,
     parse_slug_start_ts,
+    parse_twap_window_s,
 )
 
 # Маркеры интересных серий/событий в слагах и заголовках.
@@ -159,8 +160,122 @@ def print_market(m, ev_title: str, now: float, cfg: StrategySettings) -> bool:  
     elif description:
         print("    описание есть, но чисел (страйка) в нём нет")
 
+    # Ряд резолюции: 30s для 5-минутных, 60s для 15-минутных/4-часовых.
+    slug = str(getattr(m, "slug", "") or "")
+    window = parse_twap_window_s(description, slug)
+    if window is None:
+        print("    окно TWAP резолюции: НЕ ОПРЕДЕЛЕНО — бот такой рынок отсеет")
+    else:
+        source = "из описания" if "twap-" in description.lower() else "по длительности слага"
+        print(f"    окно TWAP резолюции: {window}s ({source})")
+
+    print_rewards(m)
     print(f"    вердикт: {verdict}")
     return verdict.startswith("✓")
+
+
+def print_rewards(m) -> None:  # noqa: ANN001
+    """Реальные параметры программы ликвидити-наград рынка (Gamma)."""
+    rewards = getattr(m, "rewards", None)
+    if rewards is None:
+        print("    награды: поле rewards не отдано")
+        return
+    max_spread = getattr(rewards, "rewards_max_spread", None)
+    min_size = getattr(rewards, "rewards_min_size", None)
+    holding = getattr(rewards, "holding_rewards_enabled", None)
+    print(
+        f"    награды: max_spread={max_spread}¢ min_size={min_size} "
+        f"holding_rewards={fmt_bool(holding)}"
+    )
+    entries = getattr(rewards, "clob_rewards", None) or []
+    if not entries:
+        print("      clobRewards: пусто — рынок НЕ в программе наград (или данные не отданы)")
+        return
+    for entry in entries:
+        start = getattr(entry, "start_date", None)
+        end = getattr(entry, "end_date", None)
+        asset = str(getattr(entry, "asset_address", "") or "")
+        print(
+            f"      ставка {getattr(entry, 'rewards_daily_rate', '?')} /день, "
+            f"amount={getattr(entry, 'rewards_amount', '?')}, "
+            f"{start} → {end or 'бессрочно'}, актив {asset[:10]}…"
+        )
+
+
+# «In-game multiplier» c формулы наград: для крипторынков в docs не назван,
+# 3 — распространённая цифра, НЕ проверена. Используется только для нижней
+# границы конкуренции.
+REWARD_C_ASSUMED = Decimal("3")
+
+
+def book_reward_scores(
+    levels_bid, levels_ask, max_spread_c, min_size  # noqa: ANN001
+) -> tuple[Decimal, Decimal, Decimal] | None:
+    """
+    Очки всей книги YES по формуле программы наград: Q_one (биды) и Q_two
+    (аски) в пределах max_spread от mid, только уровни размером >= min_size.
+    Mid — по лучшим уровням не мельче min_size («size-cutoff-adjusted
+    midpoint» — наша интерпретация docs). Порядок уровней не важен.
+    Возвращает (mid, q_one, q_two) или None, если после отсева с одной из
+    сторон уровней нет — тогда очков в книге ни у кого.
+    """
+    min_size = Decimal(str(min_size))
+    v = Decimal(str(max_spread_c))
+    bids = [(Decimal(str(p)), Decimal(str(z))) for p, z in levels_bid
+            if Decimal(str(z)) >= min_size]
+    asks = [(Decimal(str(p)), Decimal(str(z))) for p, z in levels_ask
+            if Decimal(str(z)) >= min_size]
+    if not bids or not asks or v <= 0:
+        return None
+    best_bid = max(p for p, _ in bids)
+    best_ask = min(p for p, _ in asks)
+    mid = (best_bid + best_ask) / 2
+
+    def score(distance_c: Decimal, size: Decimal) -> Decimal:
+        distance_c = max(distance_c, Decimal("0"))
+        if distance_c > v:
+            return Decimal("0")
+        return ((v - distance_c) / v) ** 2 * size
+
+    q_one = sum((score((mid - p) * 100, z) for p, z in bids), Decimal("0"))
+    q_two = sum((score((p - mid) * 100, z) for p, z in asks), Decimal("0"))
+    return mid, q_one, q_two
+
+
+async def print_book_competition(client: AsyncPublicClient, t) -> None:  # noqa: ANN001
+    """
+    Конкуренция за награды по живому стакану YES (наших ордеров в нём нет —
+    diag ничего не выставляет). Сумму Q_min других мейкеров по книге точно
+    не восстановить (Q_min считается на мейкера), но границы есть:
+    max(Q_one, Q_two)/c <= sum Q_min <= Q_one + Q_two в диапазоне mid
+    0.10–0.90. Это и есть число для --reward-competition в simulate.py.
+    """
+    if t.rewards_max_spread is None or t.rewards_min_size is None:
+        print("    конкуренция: у рынка нет параметров наград — стакан не оцениваю")
+        return
+    try:
+        book = await client.get_order_book(token_id=t.yes_token_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"    конкуренция: стакан не прочитан ({exc})")
+        return
+    scored = book_reward_scores(
+        [(lvl.price, lvl.size) for lvl in book.bids],
+        [(lvl.price, lvl.size) for lvl in book.asks],
+        t.rewards_max_spread, t.rewards_min_size,
+    )
+    if scored is None:
+        print("    конкуренция: в стакане YES нет уровней >= min_size с обеих сторон — "
+              "очков сейчас ни у кого")
+        return
+    mid, q_one, q_two = scored
+    lo = max(q_one, q_two) / REWARD_C_ASSUMED
+    hi = q_one + q_two
+    print(
+        f"    стакан YES: mid(adj)={mid:.3f} | Q_one(биды)={q_one:.1f} "
+        f"Q_two(аски)={q_two:.1f} очков в пределах {t.rewards_max_spread}¢ | "
+        f"сумма Q_min других мейкеров ∈ [{lo:.1f}; {hi:.1f}] "
+        f"(низ при c={REWARD_C_ASSUMED}) → --reward-competition для simulate.py"
+    )
 
 
 def load_strategy_settings() -> StrategySettings:
@@ -343,10 +458,18 @@ async def section_parity(client: AsyncPublicClient, cfg: StrategySettings) -> in
         return 0
     print(f"  воронка: {discovery.last_funnel.describe()}")
     for t in targets:
+        if t.rewards_daily_rate is None:
+            rewards_txt = "нет"
+        else:
+            rewards_txt = (f"{t.rewards_daily_rate}/день до "
+                           f"{t.rewards_end_date or 'бессрочно'}")
         print(
             f"  ВЗЯТ: {t.slug} | {t.asset} | до экспирации {t.seconds_left:.0f}с | "
-            f"tick={t.tick_size} | комиссия={'есть' if t.fees_enabled else 'нет'}"
+            f"tick={t.tick_size} | комиссия={'есть' if t.fees_enabled else 'нет'} | "
+            f"окно TWAP={t.twap_window_s}s | награды: {rewards_txt} | "
+            f"reward_max_spread={t.rewards_max_spread} min_size={t.rewards_min_size}"
         )
+        await print_book_competition(client, t)
     if not targets:
         print("  Бот не взял ни одного рынка — причина видна в воронке выше.")
     return len(targets)

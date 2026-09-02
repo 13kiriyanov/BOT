@@ -351,16 +351,25 @@ class TradingEngine:
             self._last_regime[asset] = Regime.CALM
         return self._regimes[asset]
 
-    def _on_spot_tick(self, asset: str, price: float, ts: float) -> None:
-        detector = self._regime_for(asset)
-        detector.on_spot(price, ts)
-        self._note_regime_change(asset, detector)
-        # Реализованная часть TWAP всех рынков этого актива.
+    def _on_spot_tick(
+        self, asset: str, price: float, ts: float, window: int | None
+    ) -> None:
+        # Детектор режима — по одному ряду актива (60s или общий Binance),
+        # иначе два окна TWAP считались бы за двойной поток тиков.
+        if window in (None, 60):
+            detector = self._regime_for(asset)
+            detector.on_spot(price, ts)
+            self._note_regime_change(asset, detector)
+        # Реализованная часть TWAP — только рынкам с ОКНОМ этого тика:
+        # 5-минутный рынок резолвится по 30s-ряду, 60s-тик ему чужой.
         for market in self.markets.values():
-            if market.asset == asset:
-                tracker = self._twap.get(market.condition_id)
-                if tracker is not None:
-                    tracker.update(price, ts)
+            if market.asset != asset:
+                continue
+            if window is not None and window != market.twap_window_s:
+                continue
+            tracker = self._twap.get(market.condition_id)
+            if tracker is not None:
+                tracker.update(price, ts)
 
     def _note_regime_change(self, asset: str, detector: RegimeDetector) -> None:
         current = detector.regime
@@ -609,7 +618,9 @@ class TradingEngine:
             self._try_calibrate_strike(market, yes_book)
 
         # --- проверки допуска -------------------------------------------
-        price_stale = self.spot.is_stale(market.asset, self.cfg.risk.stale_price_timeout_s)
+        price_stale = self.spot.is_stale(
+            market.asset, self.cfg.risk.stale_price_timeout_s, market.twap_window_s
+        )
         book_stale = yes_book.is_stale(self.cfg.risk.stale_book_timeout_s)
         allowed, reason = self.risk.can_quote_market(
             market,
@@ -651,7 +662,7 @@ class TradingEngine:
         # в очереди). Границы цен ниже считаются по живому стакану.
         smoothed_mid = self._smoothed_mid(market.condition_id, float(mid))
 
-        spot = self.spot.price(market.asset)
+        spot = self.spot.price(market.asset, market.twap_window_s)
         tracker = self._twap.get(market.condition_id)
         twap_state = tracker.state(time.time()) if tracker is not None else None
 
@@ -671,9 +682,9 @@ class TradingEngine:
                 strike=float(market.strike),
                 seconds_left=market.seconds_left,
                 market_mid=smoothed_mid,
-                sigma_annual=self.spot.sigma(market.asset),
-                drift_per_second=self.spot.drift(market.asset),
-                vol_ready=self.spot.vol_ready(market.asset),
+                sigma_annual=self.spot.sigma(market.asset, market.twap_window_s),
+                drift_per_second=self.spot.drift(market.asset, market.twap_window_s),
+                vol_ready=self.spot.vol_ready(market.asset, market.twap_window_s),
                 twap_alpha=twap_state[0],
                 twap_realized=twap_state[1],
             )
@@ -770,9 +781,10 @@ class TradingEngine:
             # Дважды невалиден — новые страйки для рынка не создаём вовсе.
             return
         now = time.time()
-        spot = self.spot.price(market.asset)
+        window = market.twap_window_s
+        spot = self.spot.price(market.asset, window)
         spot_fresh = spot is not None and not self.spot.is_stale(
-            market.asset, self.cfg.risk.stale_price_timeout_s
+            market.asset, self.cfg.risk.stale_price_timeout_s, window
         )
 
         # 1. Пересечение открытия окна: спот сейчас и есть страйк.
@@ -798,7 +810,7 @@ class TradingEngine:
         if market.start_ts is not None and now < market.start_ts:
             # До открытия окна mid не несёт информации о будущем страйке.
             return
-        if not self.spot.vol_ready(market.asset) or yes_book is None:
+        if not self.spot.vol_ready(market.asset, window) or yes_book is None:
             return
         # Рынок ценит TWAP — инвертировать надо TWAP-модель, а для неё
         # нужна реализованная часть окна. Начало окна не покрыто => модель
@@ -813,7 +825,7 @@ class TradingEngine:
         lo, hi = STRIKE_CALIB_MID_BAND
         if not (lo <= float(mid) <= hi):
             return
-        sigma = self.spot.sigma(market.asset)
+        sigma = self.spot.sigma(market.asset, window)
         strike = implied_strike_twap(
             spot, float(mid), market.seconds_left, sigma,  # type: ignore[arg-type]
             alpha=twap_state[0], realized_avg=twap_state[1],
