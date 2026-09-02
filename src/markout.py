@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -70,6 +71,19 @@ BUCKET_PAIRED = "paired"
 BUCKET_SOLO = "solo"
 BUCKET_UNWIND = "unwind"
 
+# Горизонт РЫНКА (длительность окна) из слага: btc-updown-5m-<ts> -> "5m".
+# Разрез сводки по нему показывает на живых филлах, где экономика лучше —
+# на 5-минутных или 15-минутных рынках; симулятор на этот вопрос отвечает
+# только модельно (README, раздел про лестницу и наблюдаемого мейкера).
+MARKET_HORIZON_RE = re.compile(r"-(\d+[mh])-\d{10}$")
+MARKET_HORIZON_UNKNOWN = "?"
+
+
+def horizon_label_from_slug(slug: str) -> str:
+    """'btc-updown-5m-1788276000' -> '5m'; без распознаваемого хвоста — '?'."""
+    m = MARKET_HORIZON_RE.search(slug or "")
+    return m.group(1) if m else MARKET_HORIZON_UNKNOWN
+
 
 def _horizon_label(horizon_s: float) -> str:
     return f"{horizon_s:g}s"
@@ -84,6 +98,7 @@ class _Record:
     complement_token: str
     paired: Decimal = ZERO     # сколько shares этого филла вошло в пары
     unpaired: Decimal = ZERO   # остаток в FIFO-очереди для будущего матчинга
+    market_horizon: str = MARKET_HORIZON_UNKNOWN   # "5m" / "15m" / "4h" / "?"
 
 
 @dataclass(slots=True)
@@ -143,15 +158,31 @@ class MarkoutTracker:
         # (paired/solo/unwind), либо сторона рынка (YES/NO).
         self._by_bucket: dict[tuple[str, str], _Agg] = {}
         self._by_outcome: dict[tuple[str, str], _Agg] = {}
+        # Разрез по горизонту рынка: ключ "<горизонт>/<корзина>", например
+        # "5m/solo" — та же экономика корзин, но отдельно по длительности окна.
+        self._by_market_horizon: dict[tuple[str, str], _Agg] = {}
 
     # ------------------------------------------------------------- приём
 
-    def record_fill(self, fill: Fill, outcome: Outcome, complement_token: str) -> None:
-        """Принять филл: сматчить в FIFO пар и запланировать замеры."""
+    def record_fill(
+        self,
+        fill: Fill,
+        outcome: Outcome,
+        complement_token: str,
+        market_horizon: str = MARKET_HORIZON_UNKNOWN,
+    ) -> None:
+        """
+        Принять филл: сматчить в FIFO пар и запланировать замеры.
+        market_horizon — длительность окна рынка ("5m"/"15m"/...), см.
+        horizon_label_from_slug; движок берёт её из слага рынка.
+        """
         if fill.size <= 0:
             return
 
-        rec = _Record(fill=fill, outcome=outcome, complement_token=complement_token)
+        rec = _Record(
+            fill=fill, outcome=outcome, complement_token=complement_token,
+            market_horizon=market_horizon or MARKET_HORIZON_UNKNOWN,
+        )
         self._prune_old(fill.condition_id)
         if fill.side == "BUY":
             self._match_buy(rec)
@@ -263,6 +294,7 @@ class MarkoutTracker:
                 fill.size - min(rec.paired, fill.size) if fill.side == "BUY" else ZERO
             ),
             "bucket": BUCKET_UNWIND if fill.side == "SELL" else None,
+            "market_horizon": rec.market_horizon,
         }
 
         for horizon, mid in samples:
@@ -273,6 +305,10 @@ class MarkoutTracker:
                 for bucket, size in portions:
                     if size > 0:
                         self._agg(self._by_bucket, label, bucket).miss()
+                        self._agg(
+                            self._by_market_horizon, label,
+                            f"{rec.market_horizon}/{bucket}",
+                        ).miss()
                 self._agg(self._by_outcome, label, rec.outcome).miss()
                 continue
 
@@ -283,6 +319,9 @@ class MarkoutTracker:
             for bucket, size in portions:
                 if size > 0:
                     self._agg(self._by_bucket, label, bucket).add(per_share * size, size)
+                    self._agg(
+                        self._by_market_horizon, label, f"{rec.market_horizon}/{bucket}",
+                    ).add(per_share * size, size)
             self._agg(self._by_outcome, label, rec.outcome).add(markout_usdc, fill.size)
 
         try:
@@ -315,7 +354,11 @@ class MarkoutTracker:
                 }
             return out
 
-        return {"bucket": dump(self._by_bucket), "outcome": dump(self._by_outcome)}
+        return {
+            "bucket": dump(self._by_bucket),
+            "outcome": dump(self._by_outcome),
+            "market_horizon": dump(self._by_market_horizon),
+        }
 
     def summary_lines(self) -> list[str]:
         """Строки для status_loop: средний mark-out на share по горизонтам."""
@@ -335,11 +378,18 @@ class MarkoutTracker:
         if not self._by_bucket and not self._by_outcome:
             return []
 
+        # Ключи разреза по горизонту рынка — те, что реально встретились
+        # (5m/solo, 15m/paired, ...), в устойчивом порядке.
+        horizon_keys = tuple(sorted({key for _, key in self._by_market_horizon}))
+
         lines = []
         for store, keys, title in (
             (self._by_bucket, (BUCKET_PAIRED, BUCKET_SOLO, BUCKET_UNWIND), "MARKOUT"),
             (self._by_outcome, ("YES", "NO"), "MARKOUT по стороне"),
+            (self._by_market_horizon, horizon_keys, "MARKOUT по горизонту рынка"),
         ):
+            if not keys:
+                continue
             parts = []
             for horizon in self.horizons_s:
                 label = _horizon_label(horizon)
