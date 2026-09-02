@@ -152,6 +152,73 @@ def test_price_feed_consumes_real_chainlink_twap_events():
     assert client.specs[0].window_seconds == 60
 
 
+def _twap_event(symbol: str, value: str, e18: str) -> object:
+    from polymarket.models.rtds_events import CryptoPricesChainlinkTwapEvent
+
+    return CryptoPricesChainlinkTwapEvent.model_validate({
+        "type": "update", "timestamp": 1788276000000,
+        "payload": {"symbol": symbol, "timestamp": 1788276000,
+                    "value": value, "full_accuracy_value": e18,
+                    "window_s": 60},
+    })
+
+
+class RecordingFeed(SpotFeed):
+    """SpotFeed, записывающий каждый вызов ingest — для проверки отбора."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ingested: list[tuple[str, float]] = []
+
+    def ingest(self, asset: str, price: float, ts: float | None = None) -> None:
+        self.ingested.append((asset, price))
+        super().ingest(asset, price, ts)
+
+
+def test_price_feed_drops_foreign_assets_from_topic_stream(caplog):
+    """
+    Топиковая подписка приносит ВСЕ активы потока. В SpotFeed имеют право
+    попасть только BTC/ETH: чужая цена (вживую — zec/usd за 838.76,
+    скормленный первой строкой лога) не должна доходить ни до ingest, ни
+    до строки «фид жив». Первый тик логируется ПО КАЖДОМУ нужному активу.
+    """
+    import logging as _logging
+
+    events = [
+        _twap_event("zec/usd", "838.76", "838760000000000000000"),
+        _twap_event("sol/usd", "153.20", "153200000000000000000"),
+        _twap_event("btc/usd", "109500.5", "109500500000000000000000"),
+        _twap_event("zec/usd", "838.80", "838800000000000000000"),
+        _twap_event("eth/usd", "4200.25", "4200250000000000000000"),
+    ]
+    client = FakeStreamClient(events)
+    feed = RecordingFeed(vol_halflife_s=45.0, momentum_halflife_s=8.0,
+                         vol_floor_annual=D("0.30"))
+    client.stopper = feed.stop
+
+    with caplog.at_level(_logging.DEBUG, logger="polybot.price"):
+        asyncio.run(drive(feed.run_polymarket(client)))  # type: ignore[arg-type]
+
+    # ingest вызван ТОЛЬКО для наших активов — по разу на каждый.
+    assert feed.ingested == [("BTC", 109500.5), ("ETH", 4200.25)]
+    assert feed.price("BTC") == 109500.5
+    assert feed.price("ETH") == 4200.25
+
+    infos = [r.message for r in caplog.records if r.levelno == _logging.INFO]
+    # Первый тик залогирован по каждому активу; общий «первый тик» (который
+    # вживую наврал, показав zec/usd) больше не существует.
+    assert any("первый тик BTC" in m for m in infos)
+    assert any("первый тик ETH" in m for m in infos)
+    assert not any("Крипто-фид жив" in m for m in infos)
+    assert not any("zec" in m.lower() for m in infos)
+    # Чужие символы ушли в DEBUG, по разу на символ.
+    debugs = [r.message for r in caplog.records if r.levelno == _logging.DEBUG]
+    assert sum("чужой символ" in m for m in debugs) == 2  # zec и sol
+
+    # Оценщики переведены в режим сглаженного ряда (лаг-выборка 60с).
+    assert feed._est("BTC")._sample_interval == 60.0
+
+
 def test_orderbook_consumes_snapshots_through_sdk_shaped_subscribe():
     """orderbook.run: снапшот книги доезжает до локального зеркала."""
     events = [
