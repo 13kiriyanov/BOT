@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
+from typing import Callable
 
 from polymarket import AsyncSecureClient
 from polymarket.streams import MarketSpec
@@ -30,6 +31,9 @@ log = logging.getLogger("polybot.book")
 
 ONE = Decimal("1")
 
+BookListener = Callable[[str, Book, float], None]
+"""(token_id, книга после обновления, момент обновления) — слушатель зеркала."""
+
 
 class OrderBookManager:
     """Хранит книги всех подписанных токенов и держит WS-подписку."""
@@ -39,6 +43,21 @@ class OrderBookManager:
         self._token_ids: set[str] = set()
         self._resubscribe = asyncio.Event()
         self._stop = asyncio.Event()
+        self._listeners: list[BookListener] = []
+
+    def add_listener(self, listener: BookListener) -> None:
+        """Слушатель каждого применённого обновления книги (замер lead-lag)."""
+        self._listeners.append(listener)
+
+    def _notify(self, token_id: str, ts: float) -> None:
+        book = self._books.get(token_id)
+        if book is None:
+            return
+        for listener in self._listeners:
+            try:
+                listener(token_id, book, ts)
+            except Exception:  # noqa: BLE001 — измерение не должно ронять зеркало
+                log.exception("Слушатель стакана упал")
 
     # ------------------------------------------------------------------ API
 
@@ -127,6 +146,7 @@ class OrderBookManager:
                 self._apply_snapshot(
                     token, payload.bids or [], payload.asks or [], now
                 )
+                self._notify(token, now)
 
         elif etype == "price_change":
             for change in getattr(payload, "price_changes", []) or []:
@@ -140,6 +160,7 @@ class OrderBookManager:
                     str(change.side),
                     now,
                 )
+                self._notify(token, now)
 
         elif etype == "best_bid_ask":
             token = getattr(payload, "token_id", None)
@@ -153,6 +174,7 @@ class OrderBookManager:
             if ba is not None and not book.asks:
                 book.asks = [BookLevel(Decimal(str(ba)), Decimal("0"))]
             book.updated_at = now
+            self._notify(token, now)
 
         elif etype in ("market_resolved", "tick_size_change"):
             log.info("Событие рынка: %s", etype)

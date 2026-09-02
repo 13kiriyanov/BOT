@@ -31,6 +31,7 @@ from .execution import OrderManager
 from .fair_value import FairValueModel, RealizedTwap, implied_strike_twap
 from .logging_setup import log_event
 from .markout import MarkoutTracker, horizon_label_from_slug
+from .leadlag import LeadLagTracker
 from .models import (
     ONE,
     POSITION_DECIMALS,
@@ -97,6 +98,14 @@ class TradingEngine:
         self.risk = RiskManager(settings.risk)
         # Замер adverse selection по каждому филлу (см. markout.py).
         self.markout = MarkoutTracker(self._markout_mid)
+        # Замер окна опережения: фид резолюции против стакана YES
+        # (см. leadlag.py). Без него directional-логика — вера, не факт.
+        self.leadlag = LeadLagTracker(
+            move_threshold=float(settings.strategy.leadlag_move_threshold),
+            lookback_s=settings.strategy.leadlag_lookback_s,
+            timeout_s=settings.strategy.leadlag_timeout_s,
+        )
+        self.books.add_listener(self._on_book_update)
         # Детектор режима на каждый актив (BTC/ETH). Кормится тиками спота
         # и нашими филлами; реакция котирования включается флагами конфига.
         self._regimes: dict[str, RegimeDetector] = {}
@@ -351,9 +360,14 @@ class TradingEngine:
             self._last_regime[asset] = Regime.CALM
         return self._regimes[asset]
 
+    def _on_book_update(self, token_id: str, book: Book, ts: float) -> None:
+        """Каждое применённое обновление книги — в замер окна опережения."""
+        self.leadlag.on_book(token_id, book.best_bid, book.best_ask, ts)
+
     def _on_spot_tick(
         self, asset: str, price: float, ts: float, window: int | None
     ) -> None:
+        self.leadlag.on_spot_tick(asset, price, ts, window)
         # Детектор режима — по одному ряду актива (60s или общий Binance),
         # иначе два окна TWAP считались бы за двойной поток тиков.
         if window in (None, 60):
@@ -516,6 +530,9 @@ class TradingEngine:
                     )
                     self.orders.register_market(cid, m.yes_token_id, m.no_token_id)  # type: ignore[union-attr]
                     self._confirm_recovered(m)
+                    self.leadlag.register_market(
+                        cid, m.asset, m.twap_window_s, m.slug, m.yes_token_id
+                    )
                     # Накопитель реализованной части TWAP. Если бот увидел
                     # рынок после начала окна, накопитель сам признает
                     # начало непокрытым и модель для рынка не включится.
@@ -552,6 +569,7 @@ class TradingEngine:
             await self.orders.cancel(stale)  # type: ignore[union-attr]
         self.discovery.forget(market.condition_id)  # type: ignore[union-attr]
         self.markout.forget_market(market.condition_id)
+        self.leadlag.forget_market(market.condition_id)
         self._strike_meta.pop(market.condition_id, None)
         self._twap.pop(market.condition_id, None)
         self._mid_ewma.pop(market.condition_id, None)
@@ -1018,11 +1036,14 @@ class TradingEngine:
             )
             for line in self.markout.summary_lines():
                 log.info(line)
+            for line in self.leadlag.summary_lines():
+                log.info(line)
             for asset, detector in sorted(self._regimes.items()):
                 log.info("РЕЖИМ %s | %s", asset, detector.snapshot())
             log_event(
                 "status", **snap, pairs=pairs, merged=merged, net=net,
                 fees=fees, merge_gas=gas, markout=self.markout.summary(),
+                leadlag=self.leadlag.summary(),
             )
 
     async def sync_loop(self) -> None:

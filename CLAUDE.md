@@ -121,6 +121,8 @@ side/price/size — его; наша мейкерская нога лежит в
 | любой `list_*()` (пагинатор) | `async for` отдаёт ОБЪЕКТЫ Page; элементы — только через `.iter_items()`. Забытый iter_items не падает: getattr по Page молча даёт пустоту — «рынков/позиций/ордеров нет» | `test_paginator_iterates_pages_not_items` |
 | crypto-стрим (CryptoPricesChainlinkTwapSpec, окна 30s и 60s — оба одним `subscribe([...])`, MergedSubscriptionHandle; `window_seconds` события — часть ключа серии) | payload.symbol ('btc/usd')/value (точное значение — из full_accuracy_value, шкала 1e18)/window_s; фильтр symbols — КЛИЕНТСКИЙ, точное сравнение строк: несовпадение формата молча убивает весь фид. Подписка топиковая (symbols не передаём), нормализация наша | `test_crypto_prices_payload_shape_and_filter_contract` |
 | `get_order_book(token_id)` (diag.py, конкуренция за награды) | bids/asks — уровни price/size в человеческих единицах (Decimal); bids по возрастанию, asks по убыванию — ЛУЧШИЙ уровень ПОСЛЕДНИЙ (`[-1]`); diag берёт max/min и от порядка не зависит | `test_order_book_levels_are_human_units_best_is_last` |
+| `list_current_rewards()` / `list_market_rewards(condition_id=...)` (diag.py, раздел 7) | ПАГИНАТОРЫ (iter_items) по CLOB `/rewards/markets/current` и `/rewards/markets/{cid}`; `rate_per_day` — USDC/день (Decimal), даты — epoch-мс → datetime UTC; `condition_id` keyword-only. Источник истины о программе, когда Gamma `clobRewards` пуст | `test_clob_rewards_models_and_endpoints_shape` |
+| `list_series(page_size=...)` | не больше 50 — иначе «page_size must be at most 50»; пагинатор сам идёт по страницам | `test_diag_series_scan_uses_gamma_page_limit` |
 | market-стрим (book/price_change/best_bid_ask) | payload.token_id (алиас asset_id), bids/asks c price/size, price_changes[] со своими token_id/price/size/side | `test_market_stream_payload_shape` |
 
 ## Карта модулей
@@ -132,6 +134,7 @@ side/price/size — его; наша мейкерская нога лежит в
 | `src/risk.py` | Лимиты, kill switch, dead-man switch |
 | `src/execution.py` | Ордера: cancel/replace, атрибуция ног трейда, дедуп |
 | `src/markout.py` | Mark-out: adverse selection по филлам (paired/solo), разрез по горизонту рынка 5m/15m |
+| `src/leadlag.py` | Окно опережения: фид резолюции против стакана YES, задержка в мс, медиана/p10 по активу |
 | `src/regime.py` | Детектор режима CALM/TRENDING/VOLATILE, гистерезис |
 | `src/engine.py` | Оркестрация 10 asyncio-задач |
 | `src/discovery.py` | Поиск рынков + калибровка страйка (3 стратегии) |
@@ -252,6 +255,20 @@ API без ключей и ордеров, печатает актуальные
    заведены как флаги `--market-model endpoint` и `--noise`; проверяются
    только по живым логам (mid против model к концу окна, амплитуда хода
    mid, сторона остатка по mark-out). Не тюнь toxicity под его цифры.
+16. Программа наград вживую: Gamma `clobRewards` пуст у всех взятых
+   рынков (сентябрь 2026). `diag.py` (раздел 7) сверяет CLOB
+   `/rewards/markets/current` и `/rewards/markets/{cid}`; если и там пусто —
+   программы для этих рынков нет, и раздел README про награды описывает
+   экономику, которой сейчас нет. discovery читает только Gamma:
+   `TargetMarket.rewards_daily_rate` останется пустым, даже если CLOB
+   отдаст ставку — переводить discovery на CLOB стоит только после того,
+   как ставка там реально появится.
+17. Окно опережения (`leadlag.py`): порог хода фида
+   `STRAT_LEADLAG_MOVE_THRESHOLD=0.0005` (5 bp) — стартовое значение, не
+   калибровано; подбирать по живому распределению тиков (десятки событий в
+   час). Пока медиана задержки стакана не измерена, directional-логика —
+   вера, не факт; медиана ≤ 0 означает, что честнее
+   `STRAT_ALLOW_DIRECTIONAL=false`.
    Уточнение: он торгует и мержит на 5m. В час на равный капитал
    (`--horizon-compare`, пиковый капитал окна) 15m впереди 5m при любой
    toxicity во всех конфигурациях — оборот капитала (гипотеза б) 5m не

@@ -111,12 +111,17 @@ class FakeGammaClient:
         events: list[Event] | None = None,
         series_error: Exception | None = None,
         events_error: Exception | None = None,
+        rewards_current: list | None = None,
+        rewards_market: dict[str, list] | None = None,
     ) -> None:
         self._series = series or {}
         self._events = events or []
         self._series_error = series_error
         self._events_error = events_error
+        self._rewards_current = rewards_current or []
+        self._rewards_market = rewards_market or {}
         self.series_queries: list[str] = []
+        self.series_page_sizes: list[int] = []
         self.event_queries: list[str] = []
         self.event_fetches: list = []      # обращения к страницам list_events
 
@@ -124,6 +129,10 @@ class FakeGammaClient:
         self, *, slug: str | None = None, closed: bool, page_size: int
     ) -> AsyncPaginator:
         self.series_queries.append(slug or "*")
+        self.series_page_sizes.append(page_size)
+        if page_size > 50:
+            # Как Gamma/SDK вживую: «page_size must be at most 50».
+            raise ValueError("page_size must be at most 50")
         if self._series_error is not None:
             raise self._series_error
         if slug is None:
@@ -137,6 +146,15 @@ class FakeGammaClient:
         if self._events_error is not None:
             raise self._events_error
         return paginate(self._events, fetch_log=self.event_fetches)
+
+    # Награды по CLOB — тоже пагинаторы (публичный клиент SDK).
+    def list_current_rewards(self, *, sponsored: bool | None = None) -> AsyncPaginator:
+        return paginate(self._rewards_current)
+
+    def list_market_rewards(
+        self, *, condition_id: str, sponsored: bool | None = None
+    ) -> AsyncPaginator:
+        return paginate(self._rewards_market.get(condition_id, []))
 
 
 def make_discovery(client: FakeGammaClient, **over) -> MarketDiscovery:
@@ -544,3 +562,68 @@ def test_book_reward_scores_filters_dust_and_spread():
     assert book_reward_scores(list(reversed(bids)), list(reversed(asks)),
                               D("3.5"), D("20")) == scored
     assert book_reward_scores(bids, [(D("0.52"), D("10"))], D("3.5"), D("20")) is None
+
+
+def test_diag_series_scan_uses_gamma_page_limit(monkeypatch, capsys):
+    """Скан серий: page_size не больше 50 — иначе Gamma отвечает ошибкой."""
+    import argparse
+
+    import diag
+
+    fake = FakeGammaClient(series={}, events=[])
+    _fake_public(monkeypatch, fake)
+    asyncio.run(diag.run(argparse.Namespace(max_series=50, horizon_hours=24.0)))
+    out = capsys.readouterr().out
+    assert "*" in fake.series_queries
+    assert all(size <= 50 for size in fake.series_page_sizes)
+    assert "СКАН НЕ УДАЛСЯ" not in out
+
+
+def test_diag_rewards_section_reads_clob_not_only_gamma(monkeypatch, capsys):
+    """
+    Раздел 7: Gamma clobRewards пуст, но CLOB /rewards/markets/current и
+    /rewards/markets/{cid} отдают ставку — diag печатает её и вердикт
+    «CLOB отдаёт ставки, Gamma — нет». Без CLOB-ставок — вердикт «программа
+    НЕ АКТИВНА». Модели — настоящие SDK-модели наград.
+    """
+    import argparse
+
+    import diag
+    from polymarket.models.clob.rewards import CurrentReward, MarketReward
+
+    cid = "0x" + "ab" * 32
+    current = CurrentReward.model_validate({
+        "condition_id": cid, "rewards_max_spread": 3.5, "rewards_min_size": "20",
+        "rewards_config": [{"asset_address": "0xusdc", "start_date": 1756684800000,
+                            "end_date": None, "rate_per_day": "33.6"}],
+        "native_daily_rate": "33.6", "total_daily_rate": "33.6", "sponsors_count": 0,
+    })
+    market_reward = MarketReward.model_validate({
+        "condition_id": cid, "question": "Bitcoin Up or Down?",
+        "market_slug": "btc-updown-5m-1788276000", "rewards_max_spread": 3.5,
+        "rewards_min_size": "20", "market_competitiveness": 1.7,
+        "tokens": [{"token_id": "111", "outcome": "Up", "price": "0.51"}],
+        "rewards_config": [{"asset_address": "0xusdc", "start_date": 1756684800000,
+                            "end_date": None, "rate_per_day": "33.6"}],
+    })
+    ev = gamma_event([market_dict(1, slug="btc-updown-5m-1788276000", conditionId=cid)])
+    fake = FakeGammaClient(
+        series={}, events=[ev],
+        rewards_current=[current], rewards_market={cid: [market_reward]},
+    )
+    _fake_public(monkeypatch, fake)
+    code = asyncio.run(diag.run(argparse.Namespace(max_series=50, horizon_hours=24.0)))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "рынков с активной программой на CLOB (всего по бирже): 1" in out
+    assert "33.6/день" in out
+    assert "competitiveness=1.7" in out
+    assert "CLOB отдаёт ставки, Gamma — нет" in out
+
+    # Без ставок ни в одном источнике — программа неактивна, и это сказано прямо.
+    fake = FakeGammaClient(series={}, events=[ev])
+    _fake_public(monkeypatch, fake)
+    asyncio.run(diag.run(argparse.Namespace(max_series=50, horizon_hours=24.0)))
+    out = capsys.readouterr().out
+    assert "рынка НЕТ в списке активных программ" in out
+    assert "НЕ АКТИВНА ни по Gamma, ни по CLOB" in out

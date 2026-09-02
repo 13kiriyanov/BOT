@@ -52,6 +52,9 @@ class Cfg:
         ladder_levels = 1
         ladder_step_ticks = 2
         ladder_level_size = D("0")
+        leadlag_move_threshold = D("0.0005")
+        leadlag_lookback_s = 5.0
+        leadlag_timeout_s = 10.0
         auto_merge = True
         min_merge_size = D("25")
         merge_interval_s = 0.0
@@ -937,3 +940,48 @@ def test_ladder_room_is_cumulative_across_levels():
     yes = sorted((q for q in quotes if q.outcome == "YES"), key=lambda q: q.level)
     assert [q.size for q in yes] == [D("10"), D("10"), D("5")]
     assert sum(q.size for q in yes) == D("25")
+
+
+# ------------------------------------------------------------ lead-lag
+
+
+def test_lead_lag_is_measured_from_feed_ticks_and_book_events():
+    """
+    Тик фида с ходом выше порога -> ждём сдвиг стакана YES; обновление
+    зеркала стаканов (market-канал) доезжает до замера через слушателя, и
+    событие lead_lag получает задержку в мс и рынок из слага.
+    """
+    from src.leadlag import LeadLagTracker
+
+    events = []
+    engine = make_engine(FakeClient())
+    engine.leadlag = LeadLagTracker(0.0005, 5.0, 10.0, sink=lambda e, **f: events.append(f))
+    market = make_market(slug="btc-updown-5m-1788276000", twap_window_s=30)
+    engine.markets["0xcond"] = market
+    engine.leadlag.register_market("0xcond", "BTC", 30, market.slug, "tok_yes")
+
+    # Стакан YES живёт в зеркале; первый снапшот задаёт опорный mid.
+    engine.books._handle_event(ApiPosition(type="book", payload=ApiPosition(
+        token_id="tok_yes",
+        bids=[ApiPosition(price="0.49", size="100")],
+        asks=[ApiPosition(price="0.51", size="80")],
+    )))
+    t0 = time.time()
+    engine._on_spot_tick("BTC", 100_000.0, t0 - 1.0, 30)
+    engine._on_spot_tick("BTC", 100_080.0, t0, 30)          # +8 bp
+    assert events == []
+    # Лучший бид ушёл вверх — стакан ответил (через best_bid_ask).
+    engine.books._handle_event(ApiPosition(type="best_bid_ask", payload=ApiPosition(
+        token_id="tok_yes", best_bid="0.50", best_ask="0.52",
+    )))
+    # best_bid_ask не трогает уже существующие уровни — сдвиг даёт price_change.
+    engine.books._handle_event(ApiPosition(type="price_change", payload=ApiPosition(
+        price_changes=[ApiPosition(token_id="tok_yes", price="0.50", size="120", side="BUY")],
+    )))
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["asset"] == "BTC" and ev["market"] == "btc-updown-5m-1788276000"
+    assert ev["direction"] == 1 and ev["timeout"] is False
+    assert 0.0 <= ev["delay_ms"] < 5000.0
+    assert engine.leadlag.summary()["BTC"]["n"] == 1
+    assert engine.leadlag.summary_lines()[0].startswith("LEAD-LAG BTC | ")

@@ -53,6 +53,9 @@ from src.discovery import (
     parse_twap_window_s,
 )
 
+# Предел page_size у Gamma для list_series (больше — UserInputError/400).
+SERIES_PAGE_SIZE = 50
+
 # Маркеры интересных серий/событий в слагах и заголовках.
 MARKERS = ("up-or-down", "up or down", "up/down", "updown", "up-down", "twap")
 
@@ -333,7 +336,9 @@ async def section_scan_series(
     matched: list = []
     scanned = 0
     try:
-        paginator = client.list_series(closed=False, page_size=100)
+        # Gamma принимает page_size не больше 50 для серий («page_size must
+        # be at most 50»); дальше пагинатор сам идёт по страницам.
+        paginator = client.list_series(closed=False, page_size=SERIES_PAGE_SIZE)
         async for series in paginator.iter_items():
             scanned += 1
             if matches_markers(getattr(series, "slug", None), getattr(series, "title", None)):
@@ -438,8 +443,8 @@ def section_candidates(
     return takeable
 
 
-async def section_parity(client: AsyncPublicClient, cfg: StrategySettings) -> int:
-    """Раздел 6: настоящий MarketDiscovery с настройками бота."""
+async def section_parity(client: AsyncPublicClient, cfg: StrategySettings) -> list:
+    """Раздел 6: настоящий MarketDiscovery с настройками бота. Возвращает взятые рынки."""
     print("\n=== 6. Паритет: MarketDiscovery.find_markets() как в боте =======")
     discovery = MarketDiscovery(
         client,  # type: ignore[arg-type] — нужные методы у публичного клиента те же
@@ -455,7 +460,7 @@ async def section_parity(client: AsyncPublicClient, cfg: StrategySettings) -> in
         targets = await discovery.find_markets({})
     except Exception as exc:  # noqa: BLE001
         print(f"  find_markets УПАЛ: {exc}")
-        return 0
+        return []
     print(f"  воронка: {discovery.last_funnel.describe()}")
     for t in targets:
         if t.rewards_daily_rate is None:
@@ -472,7 +477,113 @@ async def section_parity(client: AsyncPublicClient, cfg: StrategySettings) -> in
         await print_book_competition(client, t)
     if not targets:
         print("  Бот не взял ни одного рынка — причина видна в воронке выше.")
-    return len(targets)
+    return targets
+
+
+def _fmt_reward_config(cfg) -> str:  # noqa: ANN001
+    start = getattr(cfg, "start_date", None)
+    end = getattr(cfg, "end_date", None)
+    fmt = lambda d: d.strftime("%Y-%m-%d") if d is not None else "бессрочно"  # noqa: E731
+    return (f"{getattr(cfg, 'rate_per_day', '?')}/день "
+            f"({fmt(start)} → {fmt(end)}, всего {getattr(cfg, 'total_rewards', '?')})")
+
+
+async def section_rewards(client: AsyncPublicClient, targets: list) -> dict:
+    """
+    Раздел 7: активные программы наград ПО CLOB, а не по Gamma.
+
+    Gamma отдаёт clobRewards в карточке рынка, и вживую он оказался пуст у
+    всех взятых рынков. У CLOB есть свой источник истины — эндпоинты
+    /rewards/markets/current (все рынки с активной программой) и
+    /rewards/markets/{condition_id} (конфиг конкретного рынка, включая
+    market_competitiveness). Если и они пусты — программы для этих рынков
+    нет, и экономика бота — только торговый PnL (README).
+    Возвращает сводку {condition_id: ставка/день по CLOB или None}.
+    """
+    print("\n=== 7. Награды по CLOB: /rewards/markets/current, /rewards/markets/{cid} ===")
+    verdict: dict[str, object] = {}
+    active: dict[str, object] = {}
+    n_active = 0
+    try:
+        async for reward in client.list_current_rewards().iter_items():
+            n_active += 1
+            active[str(getattr(reward, "condition_id", ""))] = reward
+            if n_active >= 5000:
+                print("  (список активных программ оборван на 5000)")
+                break
+        print(f"  рынков с активной программой на CLOB (всего по бирже): {n_active}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  list_current_rewards НЕ УДАЛСЯ: {exc}")
+
+    if not targets:
+        print("  взятых рынков нет — сверять не с чем")
+        return verdict
+
+    for t in targets:
+        gamma_rate = t.rewards_daily_rate
+        current = active.get(str(t.condition_id))
+        configs: list = []
+        competitiveness = None
+        try:
+            async for m in client.list_market_rewards(condition_id=t.condition_id).iter_items():
+                configs.extend(getattr(m, "rewards_config", None) or [])
+                competitiveness = getattr(m, "market_competitiveness", competitiveness)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {t.slug}: list_market_rewards НЕ УДАЛСЯ: {exc}")
+
+        clob_rate = None
+        if current is not None:
+            clob_rate = getattr(current, "total_daily_rate", None)
+            if clob_rate is None:
+                clob_rate = sum(
+                    (getattr(c, "rate_per_day", Decimal("0")) for c in
+                     getattr(current, "rewards_config", None) or []),
+                    Decimal("0"),
+                ) or None
+        if clob_rate is None and configs:
+            clob_rate = sum((getattr(c, "rate_per_day", Decimal("0")) for c in configs),
+                            Decimal("0")) or None
+        verdict[str(t.condition_id)] = clob_rate
+
+        print(f"  {t.slug}:")
+        print(f"    Gamma clobRewards: {gamma_rate if gamma_rate is not None else 'пусто'}")
+        if current is None:
+            print("    CLOB /rewards/markets/current: рынка НЕТ в списке активных программ")
+        else:
+            print(
+                f"    CLOB current: total={getattr(current, 'total_daily_rate', None)} "
+                f"native={getattr(current, 'native_daily_rate', None)} "
+                f"sponsored={getattr(current, 'sponsored_daily_rate', None)} "
+                f"(спонсоров {getattr(current, 'sponsors_count', None)}) | "
+                f"max_spread={getattr(current, 'rewards_max_spread', None)}¢ "
+                f"min_size={getattr(current, 'rewards_min_size', None)}"
+            )
+            for cfg in getattr(current, "rewards_config", None) or []:
+                print(f"      конфиг: {_fmt_reward_config(cfg)}")
+        if configs:
+            print(f"    CLOB /rewards/markets/{{cid}}: competitiveness={competitiveness}")
+            for cfg in configs:
+                print(f"      конфиг: {_fmt_reward_config(cfg)}")
+        else:
+            print("    CLOB /rewards/markets/{cid}: конфигов наград нет")
+
+    with_clob = [cid for cid, rate in verdict.items() if rate]
+    with_gamma = [t for t in targets if t.rewards_daily_rate]
+    if not with_clob and not with_gamma:
+        print(
+            "  ВЕРДИКТ: программа наград для взятых рынков НЕ АКТИВНА ни по Gamma, "
+            "ни по CLOB. Экономика бота — только торговый PnL: раздел README про "
+            "награды описывает то, чего сейчас нет."
+        )
+    elif with_clob and not with_gamma:
+        print(
+            "  ВЕРДИКТ: CLOB отдаёт ставки, Gamma — нет: discovery читает Gamma и "
+            "оставляет TargetMarket.rewards_daily_rate пустым. Ставки для "
+            "simulate.py --reward-daily-rate брать из строк CLOB выше."
+        )
+    else:
+        print("  ВЕРДИКТ: программа активна — ставки выше, подставляй в simulate.py.")
+    return verdict
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -498,7 +609,9 @@ async def run(args: argparse.Namespace) -> int:
         takeable = section_candidates(
             bot_events + series_events + probe_events, cfg, args.horizon_hours
         )
-        parity = await section_parity(client, cfg)
+        targets = await section_parity(client, cfg)
+        parity = len(targets)
+        await section_rewards(client, targets)
 
     print("\n=== ИТОГ ========================================================")
     if parity > 0:

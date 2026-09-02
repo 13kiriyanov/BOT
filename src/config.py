@@ -218,6 +218,19 @@ class StrategySettings(BaseSettings):
     # сэмплов <= 50%, завышение ограничено sqrt(2) < порога входа 1.8.
     regime_vol_min_elapsed_s: float = 300.0
 
+    # --- Окно опережения (lead-lag) ------------------------------------------
+    # Замер, есть ли у бота информационное окно: насколько стакан YES отстаёт
+    # от фида резолюции (src/leadlag.py; события lead_lag, строка LEAD-LAG в
+    # статусе). Порог хода фида в долях цены: 0.0005 = 5 bp ≈ $50 на BTC при
+    # 100k — СТАРТОВОЕ значение, не калибровано: подбирается по живому
+    # распределению тиков так, чтобы событий было десятки в час, а не сотни
+    # (шум) и не единицы.
+    leadlag_move_threshold: Decimal = Decimal("0.0005")
+    # Насколько назад (сек) сдвиг стакана считается «стакан двинулся раньше».
+    leadlag_lookback_s: float = 5.0
+    # Сколько ждать (сек) ответного сдвига стакана до тайм-аута.
+    leadlag_timeout_s: float = 10.0
+
     # --- Валидность страйка --------------------------------------------------
     # Сторож расхождения модели с рынком. Если |model - mid| держится выше
     # порога дольше окна, страйк признаётся невалидным: модель для рынка
@@ -363,6 +376,10 @@ class Settings:
             raise ValueError("STRAT_QUOTE_MID_MIN/MAX: нужно 0 <= min < max <= 1")
         if s.fair_mid_smoothing_halflife_s < 0:
             raise ValueError("STRAT_FAIR_MID_SMOOTHING_HALFLIFE_S не может быть < 0")
+        if not (Decimal("0") < s.leadlag_move_threshold < Decimal("0.1")):
+            raise ValueError("STRAT_LEADLAG_MOVE_THRESHOLD вне диапазона (0, 0.1)")
+        if s.leadlag_lookback_s < 0 or s.leadlag_timeout_s <= 0:
+            raise ValueError("STRAT_LEADLAG_LOOKBACK_S >= 0 и STRAT_LEADLAG_TIMEOUT_S > 0")
         if s.ladder_levels < 1 or s.ladder_step_ticks < 1 or s.ladder_level_size < 0:
             raise ValueError(
                 "STRAT_LADDER_LEVELS >= 1, STRAT_LADDER_STEP_TICKS >= 1, "
