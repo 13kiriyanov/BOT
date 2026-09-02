@@ -30,7 +30,7 @@ from .discovery import MarketDiscovery
 from .execution import OrderManager
 from .fair_value import FairValueModel, RealizedTwap, implied_strike_twap
 from .logging_setup import log_event
-from .markout import MarkoutTracker
+from .markout import MarkoutTracker, horizon_label_from_slug
 from .models import (
     ONE,
     POSITION_DECIMALS,
@@ -418,7 +418,8 @@ class TradingEngine:
             self.risk.record_realized(pos.realized_pnl - before)
 
         self.markout.record_fill(
-            fill, outcome, market.token_for(market.other(outcome))
+            fill, outcome, market.token_for(market.other(outcome)),
+            market_horizon=horizon_label_from_slug(market.slug),
         )
 
         detector = self._regime_for(market.asset)

@@ -220,10 +220,66 @@ def test_summary_lines_render_both_views():
 
     tracker, _ = run_tracker(mid_source, [(make_fill(), "YES", "tok_no")])
     lines = tracker.summary_lines()
-    assert len(lines) == 2
+    assert len(lines) == 3
     assert lines[0].startswith("MARKOUT | ")
     assert "solo=" in lines[0] and "paired=" in lines[0]
     assert lines[1].startswith("MARKOUT по стороне | ")
     assert "YES=" in lines[1] and "NO=" in lines[1]
+    # Третья строка — разрез по горизонту рынка; без слага горизонт "?".
+    assert lines[2].startswith("MARKOUT по горизонту рынка | ")
+    assert "?/solo=" in lines[2]
     # Пустой трекер не шумит в статус.
     assert MarkoutTracker(mid_source, horizons_s=HORIZONS).summary_lines() == []
+
+
+def test_market_horizon_label_from_slug():
+    from src.markout import horizon_label_from_slug
+
+    assert horizon_label_from_slug("btc-updown-5m-1788276000") == "5m"
+    assert horizon_label_from_slug("eth-updown-15m-1788276000") == "15m"
+    assert horizon_label_from_slug("btc-updown-4h-1788276000") == "4h"
+    assert horizon_label_from_slug("bitcoin-up-or-down-test") == "?"
+    assert horizon_label_from_slug("") == "?"
+
+
+def test_summary_splits_by_market_horizon():
+    """
+    Разрез по горизонту рынка: филлы 5-минутных и 15-минутных рынков
+    копятся в разные ячейки с той же экономикой корзин (paired/solo), чтобы
+    на живых филлах было видно, где mark-out лучше.
+    """
+    mids = {"tok_yes": D("0.50"), "tok_no": D("0.45")}
+
+    def mid_source(token, _complement):
+        return mids[token]
+
+    fills = [
+        # 5m: одиночная покупка YES по 0.49 -> solo, mark-out +0.01/share.
+        (make_fill(trade_id="a", condition_id="c5", token_id="tok_yes", price=D("0.49")),
+         "YES", "tok_no"),
+        # 15m: покупка NO по 0.48 -> solo, mark-out -0.03/share.
+        (make_fill(trade_id="b", condition_id="c15", token_id="tok_no", price=D("0.48")),
+         "NO", "tok_yes"),
+    ]
+    sink = Sink()
+    tracker = MarkoutTracker(mid_source, horizons_s=(0.01,), sink=sink)
+
+    async def drive() -> None:
+        tracker.record_fill(*fills[0], market_horizon="5m")
+        tracker.record_fill(*fills[1], market_horizon="15m")
+        while tracker.pending:
+            await asyncio.sleep(0.005)
+
+    asyncio.run(drive())
+
+    by_h = tracker.summary()["market_horizon"]["0.01s"]
+    assert by_h["5m/solo"]["per_share"] == pytest.approx(0.01)
+    assert by_h["15m/solo"]["per_share"] == pytest.approx(-0.03)
+    assert by_h["5m/solo"]["n"] == 1 and by_h["15m/solo"]["n"] == 1
+    assert {e["market_horizon"] for e in sink.events} == {"5m", "15m"}
+    lines = tracker.summary_lines()
+    assert any(line.startswith("MARKOUT по горизонту рынка") and "5m/solo=" in line
+               and "15m/solo=" in line for line in lines)
+    # Без разреза (горизонт неизвестен) строка всё равно есть — ячейка "?/...".
+    tracker2, _ = run_tracker(mid_source, [fills[0]], horizons=(0.01,))
+    assert "?/solo" in tracker2.summary()["market_horizon"]["0.01s"]

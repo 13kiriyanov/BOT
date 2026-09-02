@@ -298,3 +298,24 @@ def test_ladder_and_market_model_flags_change_the_run():
     naive = run_one(600, 0.55, 0.012, 0.02, 11, 0.35, 0.45, D("0"), D("0.01"),
                     0.0, 0.0, False, True, 120.0, "twap", None, market_model="endpoint")
     assert (naive["pnl"], naive["fills"]) != (base["pnl"], base["fills"])
+
+
+def test_peak_capital_and_hour_stats():
+    """
+    Пиковый капитал окна — максимум себестоимости инвентаря на руках, не
+    отрицателен и не меньше стоимости незакрытого остатка; пересчёт «в час»
+    умножает PnL окна на число окон в часе и нормирует на пиковый капитал.
+    """
+    from simulate import hour_stats
+
+    r = run_one(300, 0.55, 0.012, 0.02, 4, 0.2, 0.45, D("0"), D("0.01"),
+                0.0, 0.0, False, True, 120.0, "twap", None)
+    assert r["window_s"] == 300
+    assert r["peak_capital"] >= 0.0
+    if r["fills"] > 0:
+        assert r["peak_capital"] > 0.0
+    text = hour_stats([r])
+    assert "12 окон" in text
+    assert f"{r['pnl'] * 12:+.2f}" in text
+    if r["peak_capital"] > 0:
+        assert f"{r['pnl'] / r['peak_capital'] * 100 * 12:+.2f}" in text

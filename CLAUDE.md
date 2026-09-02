@@ -131,7 +131,7 @@ side/price/size — его; наша мейкерская нога лежит в
 | `src/fair_value.py` | GBM-модель, EWMA волатильность и momentum |
 | `src/risk.py` | Лимиты, kill switch, dead-man switch |
 | `src/execution.py` | Ордера: cancel/replace, атрибуция ног трейда, дедуп |
-| `src/markout.py` | Mark-out: adverse selection по филлам (paired/solo) |
+| `src/markout.py` | Mark-out: adverse selection по филлам (paired/solo), разрез по горизонту рынка 5m/15m |
 | `src/regime.py` | Детектор режима CALM/TRENDING/VOLATILE, гистерезис |
 | `src/engine.py` | Оркестрация 10 asyncio-задач |
 | `src/discovery.py` | Поиск рынков + калибровка страйка (3 стратегии) |

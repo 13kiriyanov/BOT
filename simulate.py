@@ -365,6 +365,10 @@ def run_one(window_s: int, sigma: float, market_noise: float,
     fills = 0
     unwound = 0.0
     bought = {"YES": 0.0, "NO": 0.0}
+    # Пиковый занятый капитал окна: максимум себестоимости инвентаря на
+    # руках (merge и резолюция его возвращают). Это капитал, который нужен,
+    # чтобы прожить окно, — им нормируется PnL «на час при равном капитале».
+    peak_capital = 0.0
     for step in range(window_s):
         left = window_s - step
         market.end_ts = 9e18  # seconds_left переопределим вручную ниже
@@ -541,6 +545,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
                 # Купили YES -> спот идёт вниз, и наоборот.
                 spot *= math.exp(-shock * 8 if q.outcome == "YES" else shock * 8)
 
+        peak_capital = max(peak_capital, float(pos.total_cost))
+
         # Периодический merge.
         if step % 20 == 0 and pos.complete_pairs >= 25:
             pos.apply_merge(pos.complete_pairs, merge_gas)
@@ -587,6 +593,8 @@ def run_one(window_s: int, sigma: float, market_noise: float,
         "reward_miss_unwind": reward_miss["unwind"] / reward_samples if reward_samples else 0.0,
         "reward_miss_other": reward_miss["other"] / reward_samples if reward_samples else 0.0,
         "fills": fills,
+        "window_s": window_s,
+        "peak_capital": peak_capital,
         # PnL на одну сделку (филл) — сравнивать с наблюдаемыми мейкерами,
         # у которых известны PnL и число сделок.
         "pnl_per_fill": (float(pos.realized_pnl) / fills) if fills else 0.0,
@@ -678,6 +686,31 @@ def reward_stats(results: list[dict]) -> str:
             f"для нуля нужен пул рынка ≥ {needed:6.2f} USDC при этой доле")
 
 
+def hour_stats(results: list[dict]) -> str:
+    """
+    PnL в пересчёте на ЧАС торговли. Два числа:
+      * на один слот рынка — окна одной серии идут подряд (5m: 12 в час,
+        15m: 4 в час), PnL/окно x окон в час;
+      * на 100 USDC пикового капитала — суммарный PnL / суммарный пиковый
+        капитал окон x 100 x окон в час: при равном капитале короткие окна
+        оборачивают его чаще (merge и резолюция возвращают деньги быстрее).
+    Пиковый капитал — максимум себестоимости инвентаря на руках за окно.
+    """
+    if not results:
+        return "нет окон"
+    window_s = results[0]["window_s"]
+    per_hour = 3600.0 / window_s
+    mean_pnl = statistics.mean(r["pnl"] for r in results)
+    total_peak = sum(r["peak_capital"] for r in results)
+    mean_peak = total_peak / len(results)
+    if total_peak <= 0:
+        return f"слот {mean_pnl * per_hour:+.2f} USDC/час | капитал не занимался"
+    roc = sum(r["pnl"] for r in results) / total_peak
+    return (f"слот {mean_pnl * per_hour:+.2f} USDC/час ({per_hour:.0f} окон) | "
+            f"на 100 USDC пикового капитала {roc * 100 * per_hour:+.2f} USDC/час "
+            f"(пик {mean_peak:.0f} USDC/окно)")
+
+
 def fills_stats(results: list[dict]) -> str:
     """PnL на сделку по группе окон: суммарный PnL / суммарные филлы."""
     total_fills = sum(r["fills"] for r in results)
@@ -733,6 +766,7 @@ def print_level_report(results: list[dict]) -> None:
     print(f"Лучшее окно         : {max(pnls):+.3f}")
     print(f"Филлов за окно      : {statistics.mean(fills):.1f}")
     print(f"PnL на сделку (филл): {fills_stats(results)}")
+    print(f"В час               : {hour_stats(results)}")
     print(f"Смержено пар        : {statistics.mean(merged):.1f}")
     print(f"Доля shares в парах : {statistics.mean([r['pair_rate'] for r in results]):.1%}")
     print(f"Средний |остаток|   : {statistics.mean([r['abs_residual'] for r in results]):.1f} shares")
@@ -763,6 +797,7 @@ def run_sweep(args, levels: list[float]) -> None:
         print(f"toxicity {level:4.2f} | PnL {mean:+7.2f} ± {half:.2f} | "
               f"прибыльных {wins:.1%} ± {win_half:.1%} | "
               f"на сделку {fills_stats(results)}")
+        print(f"  в час: {hour_stats(results)}")
         if reward_params_from_args(args) is not None:
             print(f"  {reward_stats(results)}")
         print_trend_split(results)
@@ -802,6 +837,42 @@ def print_paired_by_group(base: list[dict], variant: list[dict]) -> dict:
               f"вариант {mean_on:+7.2f}, Δ {diff:+6.2f} ± {half:.2f} ({verdict})")
         diffs[name] = (diff, half)
     return diffs
+
+
+def run_horizon_compare(args, levels: list[float]) -> None:
+    """
+    5-минутные против 15-минутных рынков на одних и тех же уровнях
+    toxicity, в пересчёте на час торговли и на равный капитал. Отвечает на
+    вопрос, компенсирует ли втрое более частый оборот капитала худшую
+    экономику одного 5-минутного окна.
+    """
+    print(f"5m против 15m: {args.runs} окон на уровень, toxicity {levels}, "
+          f"пара {args.pair_cost or SimStrat.target_pair_cost}, лестница "
+          f"{args.ladder_levels}x{args.ladder_step}т, jobs={args.jobs}")
+    print("-" * 62)
+    header = ("| окно | toxicity | PnL/окно | сделок/окно | на сделку | "
+              "пик капитала | слот, USDC/час | на 100 USDC, USDC/час |")
+    print(header)
+    print("|---|---|---|---|---|---|---|---|")
+    for window_s in (300, 900):
+        sub = argparse.Namespace(**vars(args))
+        sub.window = window_s
+        for level in levels:
+            results = run_level(sub, level)
+            mean, half = mean_ci([r["pnl"] for r in results])
+            per_hour = 3600.0 / window_s
+            total_fills = sum(r["fills"] for r in results)
+            per_fill = sum(r["pnl"] for r in results) / total_fills if total_fills else 0.0
+            total_peak = sum(r["peak_capital"] for r in results)
+            mean_peak = total_peak / len(results)
+            per_100 = (sum(r["pnl"] for r in results) / total_peak * 100 * per_hour
+                       if total_peak > 0 else 0.0)
+            print(f"| {window_s // 60}m | {level:.2f} | {mean:+.2f} ± {half:.2f} | "
+                  f"{total_fills / len(results):.1f} | {per_fill:+.3f} | "
+                  f"{mean_peak:.0f} | {mean * per_hour:+.2f} | {per_100:+.2f} |")
+    print("-" * 62)
+    print("«Слот» — окна одной серии подряд (12 или 4 в час); «на 100 USDC» —")
+    print("PnL на пиковый занятый капитал, умноженный на число окон в час.")
 
 
 def run_unwind_compare(args) -> None:
@@ -1017,6 +1088,9 @@ def main() -> None:
     ap.add_argument("--market-model", choices=["twap", "endpoint"], default="twap",
                     help="чем рынок ценит исход: twap — как резолюция (дефолт); "
                          "endpoint — ГИПОТЕЗА отставания розницы (см. README)")
+    ap.add_argument("--horizon-compare", type=str, default=None,
+                    help="уровни toxicity через запятую: прогнать 5m и 15m "
+                         "окна и сравнить PnL в час и на равный капитал")
     ap.add_argument("--jobs", type=int, default=1,
                     help="процессов для параллельного прогона")
     args = ap.parse_args()
@@ -1029,6 +1103,13 @@ def main() -> None:
 
     if args.unwind_compare:
         run_unwind_compare(args)
+        return
+
+    if args.horizon_compare:
+        levels = [float(x) for x in args.horizon_compare.split(",") if x.strip()]
+        if not levels:
+            raise SystemExit("--horizon-compare требует хотя бы один уровень")
+        run_horizon_compare(args, levels)
         return
 
     if args.net_sweep:

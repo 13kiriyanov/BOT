@@ -512,6 +512,29 @@ def test_fill_schedules_markout_measurement():
     assert ev["token"] == "tok_no"
     # Книг в тесте нет — mid недоступен, и это честно отражено, а не выдумано.
     assert ev["markout_0.01s"] is None
+    # Горизонт рынка берётся из слага; у тестового слага его нет.
+    assert ev["market_horizon"] == "?"
+
+
+def test_fill_markout_carries_market_horizon_from_slug():
+    """Слаг btc-updown-5m-<ts> -> разрез mark-out «5m»."""
+    from src.markout import MarkoutTracker
+
+    events = []
+    engine = make_engine(FakeClient())
+    engine.markets["0xcond"] = make_market(slug="btc-updown-5m-1788276000")
+    engine.markout = MarkoutTracker(
+        engine._markout_mid, horizons_s=(0.01,), sink=lambda e, **f: events.append(f)
+    )
+
+    async def drive():
+        await engine._on_fill(make_fill(token_id="tok_yes"))
+        while engine.markout.pending:
+            await asyncio.sleep(0.005)
+
+    asyncio.run(drive())
+    assert events[0]["market_horizon"] == "5m"
+    assert "5m/solo" in engine.markout.summary()["market_horizon"]["0.01s"]
 
 
 # ------------------------------------------------------------ режим рынка
